@@ -6,8 +6,24 @@
 <meta name="theme-color" content="#1a1a1c">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Finance Tracker">
 <title>Finance Tracker</title>
 <script>
+const installablePage = window.isSecureContext && window.top === window &&
+  /\/(?:home\/|apps-script\/(?:index\.html)?)$/.test(location.pathname) &&
+  new URLSearchParams(location.search).get('webview') !== '1';
+if (installablePage) {
+  for (const [rel, file] of [
+    ['manifest', 'manifest.webmanifest'],
+    ['icon', 'icon-192.png'],
+    ['apple-touch-icon', 'apple-touch-icon.png']
+  ]) {
+    const link = document.createElement('link');
+    link.rel = rel;
+    link.href = new URL('../apps-script/' + file, location.href).href;
+    document.head.appendChild(link);
+  }
+}
 (function () {
   var errs = [];
   window.addEventListener('error', function (e) {
@@ -1142,6 +1158,7 @@ function vSettings() {
   const tpls = DB.templates.slice().sort((a, b) => (a.order || 0) - (b.order || 0) || a.name.localeCompare(b.name)).map(t => `<div class="item drow" data-id="${t.id}"><div class="handle" title="Drag to reorder">${ic('handle', 26)}</div><div class="dot" style="background:${t.type === 'income' ? '#2f8f64' : t.type === 'transfer' ? '#7664bd' : '#3d6fb0'}">${ic(t.type === 'transfer' ? 'swap' : 'list', 22)}</div><div class="mid"><b>${esc(t.name)}</b><small>${esc(tplSummary(t))}</small></div><button class="hbtn" data-act="tpledit" data-id="${t.id}">${ic('edit', 22)}</button></div>`).join('');
   const sub = CFG.url ? (SYNC.state === 'err' ? `<span class="neg">Last attempt failed: ${esc(SYNC.msg)}</span>` : META.last ? 'Last sync: ' + new Date(META.last).toLocaleString() : 'Not synced yet') : 'Local mode (not connected)';
   return `
+  ${installablePage && !appInstalled && !standalone.matches && !navigator.standalone ? `<div class="card"><button class="btn pri full" data-act="installapp">${ic('download', 20)}Install app</button></div>` : ''}
   <div class="sec"><h2>Accounts</h2><button class="btn sm pri" data-act="addacc">${ic('plus', 18)}Add account</button></div>
   <div class="card" style="margin-top:0"><small>Drag the handle to arrange accounts. This is the order used on the home screen. Tap the pencil to rename, change the balance or credit limit.</small><div id="acclist" data-kind="acc" style="margin-top:6px">${accRows || '<div class="empty">No accounts.</div>'}</div></div>
 
@@ -2227,6 +2244,39 @@ applyTemplate = gate(applyTemplate);
 ['csv', 'backup', 'summaryimg'].forEach(k => { ACT[k] = gate(ACT[k]); });
 
 const inAndroidWebView = new URLSearchParams(location.search).get('webview') === '1';
+const standalone = matchMedia('(display-mode: standalone)');
+let installPrompt = null;
+let appInstalled = false;
+if (installablePage) {
+  window.addEventListener('beforeinstallprompt', event => {
+    event.preventDefault();
+    installPrompt = event;
+  });
+  window.addEventListener('appinstalled', () => {
+    installPrompt = null;
+    appInstalled = true;
+    if (UI.view === 'settings') render();
+  });
+}
+ACT.installapp = async () => {
+  if (installPrompt) {
+    const prompt = installPrompt;
+    installPrompt = null;
+    try {
+      await prompt.prompt();
+      return;
+    } catch (e) {
+      // The browser menu is still available if the prompt expired.
+    }
+  }
+  const ios = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+    (/Macintosh/.test(navigator.userAgent) && navigator.maxTouchPoints > 1);
+  const instructions = ios
+    ? 'In Safari, tap <b>Share</b>, then <b>Add to Home Screen</b>. Turn on <b>Open as Web App</b> if shown, then tap <b>Add</b>.'
+    : 'Open your browser menu and choose <b>Install app</b> or <b>Add to Home screen</b>. On desktop, check the address bar for the install icon.';
+  sheet('Install Finance Tracker', `<p>${instructions}</p>`, '<button class="btn pri" data-act="lclose">Done</button>');
+};
+
 let navigation = { depth: 0, guarded: false, view: UI.view, stat: UI.stat };
 let backPending = 0;
 let browserLeaving = false;
