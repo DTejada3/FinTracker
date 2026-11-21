@@ -480,6 +480,27 @@ const LS = {
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); return true; } catch (e) { return false; } },
   del(k) { try { localStorage.removeItem(k); } catch (e) { } }
 };
+const performanceLog = [];
+const serverPhases = {
+  lock: 'Server · wait for Sheet lock', open: 'Server · open spreadsheet',
+  read: 'Server · read tabs', write: 'Server · write changes',
+  image: 'Server · upload images (part of writes)', total: 'Server · total'
+};
+function logPerformance(stage, ms, status = 'ok', characters) {
+  performanceLog.push({ at: Date.now(), stage, ms: Math.round(ms), status, characters });
+  if (performanceLog.length > 100) performanceLog.shift();
+}
+function measureLocal(stage, fn) {
+  const started = performance.now();
+  let ok = false;
+  try {
+    const result = fn();
+    ok = result !== false;
+    return result;
+  } finally {
+    logPerformance(stage, performance.now() - started, ok ? 'ok' : 'failed');
+  }
+}
 // Hide-amounts preference. Saved on this device and restored on every launch.
 // Fail-safe: anything other than an explicitly saved `false` (first run, cleared storage, bad value) means hidden.
 MASK.on = LS.get('ft_mask', true) !== false;
@@ -497,17 +518,22 @@ const GAS = !!(window.google && google.script && google.script.run);
 let CFG = LS.get('ft_cfg', { url: '', key: '' });
 if (GAS) CFG.url = 'gas';
 const saveCfg = () => LS.set('ft_cfg', { url: GAS ? '' : CFG.url, key: CFG.key });
-let DB = Object.assign(emptyDB(), LS.get('ft_db', {}));
-let QUEUE = LS.get('ft_queue', []);
-let META = LS.get('ft_meta', { last: 0 });
+let DB, QUEUE, META;
+measureLocal('Startup · read device cache', () => {
+  DB = Object.assign(emptyDB(), LS.get('ft_db', {}));
+  QUEUE = LS.get('ft_queue', []);
+  META = LS.get('ft_meta', { last: 0 });
+  QUEUE.forEach(op => applyOp(DB, op));
+});
 let ver = 0;
 
-let persistT = null;
-function persistSoon() { clearTimeout(persistT); persistT = setTimeout(persistNow, 60); }
+let persistT = null, dbDirty = false, queueDirty = false;
+function persistSoon() { dbDirty = true; clearTimeout(persistT); persistT = setTimeout(persistNow, 60); }
 function persistNow() {
   clearTimeout(persistT);
-  const ok = LS.set('ft_db', DB) && LS.set('ft_queue', QUEUE);
-  if (!ok && !persistNow.warned) { persistNow.warned = true; setTimeout(() => toast('This device is out of storage space. Connect your Google Sheet so pictures are saved there.'), 300); }
+  if (dbDirty) dbDirty = !measureLocal('Device · save records cache', () => LS.set('ft_db', DB));
+  if (queueDirty) queueDirty = !measureLocal('Device · save pending changes', () => LS.set('ft_queue', QUEUE));
+  if ((dbDirty || queueDirty) && !persistNow.warned) { persistNow.warned = true; setTimeout(() => toast('This device is out of storage space. Connect your Google Sheet so pictures are saved there.'), 300); }
 }
 window.addEventListener('pagehide', persistNow);
 
@@ -530,6 +556,7 @@ function pushOp(op) {
   const id = op.row ? op.row.id : op.id;
   QUEUE = QUEUE.filter(o => !(o.sheet === op.sheet && (o.row ? o.row.id : o.id) === id));
   QUEUE.push(op);
+  queueDirty = true;
   applyOp(DB, op); ver++; persistSoon(); scheduleSync();
 }
 const up = (sheet, row) => { row = JSON.parse(JSON.stringify(row)); pushOp({ op: 'upsert', sheet, row }); return row; };
@@ -647,44 +674,69 @@ function seedIfNeeded() {
   setSetting('seeded', '1');
 }
 
-let syncing = false, syncT = null;
+let syncing = false, syncT = null, combinedSync;
 const SYNC = { state: 'idle', msg: '' };
 function setSync(state, msg = '') { SYNC.state = state; SYNC.msg = msg; if (typeof renderSyncBtn === 'function') renderSyncBtn(); }
 class ConnError extends Error { constructor(kind, msg) { super(msg); this.kind = kind; } }
-function gasCall(action, payload) {
+function gasCall(body) {
   return new Promise((resolve, reject) => {
     const to = setTimeout(() => reject(new ConnError('timeout', 'The request timed out')), 90000);
     google.script.run
-      .withSuccessHandler(s => { clearTimeout(to); try { resolve(JSON.parse(s)); } catch (e) { reject(new ConnError('html', 'Google returned something unexpected')); } })
+      .withSuccessHandler(s => { clearTimeout(to); resolve(s); })
       .withFailureHandler(err => { clearTimeout(to); reject(new ConnError('network', (err && err.message) || 'Could not reach Google')); })
-      .rpc(JSON.stringify({ key: CFG.key, action, ...payload }));
+      .rpc(body);
   });
 }
 async function api(action, payload = {}) {
-  if (GAS) {
-    if (!CFG.key) throw new ConnError('nokey', 'Enter your access key');
-    const j = await gasCall(action, payload);
-    if (!j.ok) { if (j.error === 'Invalid API key') throw new ConnError('badkey', 'That access key was not accepted'); throw new Error(j.error || 'Server error'); }
-    return j;
-  }
-  const ctl = new AbortController(); const to = setTimeout(() => ctl.abort(), 90000);
-  let res;
+  const started = performance.now();
+  let status = 'failed';
   try {
-
-    res = await fetch(CFG.url, { method: 'POST', body: JSON.stringify({ key: CFG.key, action, ...payload }), redirect: 'follow', credentials: 'omit', signal: ctl.signal });
-  } catch (e) {
-    clearTimeout(to);
-    if (e.name === 'AbortError') throw new ConnError('timeout', 'The request timed out');
-
-    let reachable = false;
-    try { await fetch(CFG.url, { mode: 'no-cors', cache: 'no-store', credentials: 'omit' }); reachable = true; } catch (x) { }
-    throw new ConnError(reachable ? 'cors' : 'network', reachable ? 'Google replied but the app is not allowed to read it' : 'Could not reach script.google.com');
+    if (GAS && !CFG.key) throw new ConnError('nokey', 'Enter your access key');
+    const body = measureLocal('Browser · encode ' + action, () => JSON.stringify({ key: CFG.key, action, ...payload }));
+    const network = performance.now();
+    let response;
+    try {
+      response = await (GAS ? gasCall(body) : fetchScript(body));
+    } finally {
+      logPerformance('Browser · wait for ' + action, performance.now() - network, response === undefined ? 'failed' : 'ok', response?.length);
+    }
+    let j;
+    try { j = measureLocal('Browser · parse ' + action, () => JSON.parse(response)); }
+    catch (e) { throw new ConnError('html', 'Google returned a web page instead of data'); }
+    Object.entries(serverPhases).forEach(([phase, label]) => {
+      const ms = j.timings?.[phase];
+      if (Number.isFinite(ms) && ms >= 0) logPerformance(label + ' (' + action + ')', ms, 'measured');
+    });
+    if (!j.ok) {
+      if (GAS && j.error === 'Invalid API key') throw new ConnError('badkey', 'That access key was not accepted');
+      throw new Error(j.error || 'Server error');
+    }
+    if (action === 'getAll' || action === 'ping') combinedSync = j.capabilities?.syncBatch === true;
+    status = j.snapshotError || j.errors?.length ? 'partial' : 'ok';
+    return j;
+  } finally {
+    logPerformance('Request · ' + action, performance.now() - started, status);
   }
-  clearTimeout(to);
-  let j;
-  try { j = await res.json(); } catch (e) { throw new ConnError('html', 'Google returned a web page instead of data'); }
-  if (!j.ok) throw new Error(j.error || 'Server error');
-  return j;
+}
+async function fetchScript(body) {
+  const ctl = new AbortController();
+  const to = setTimeout(() => ctl.abort(), 90000);
+  const url = CFG.url;
+  try {
+    const res = await fetch(url, { method: 'POST', body, redirect: 'follow', credentials: 'omit', signal: ctl.signal });
+    return await res.text();
+  } catch (e) {
+    if (e.name === 'AbortError') throw new ConnError('timeout', 'The request timed out');
+    const probe = new AbortController();
+    const timeout = setTimeout(() => probe.abort(), 3000);
+    let reachable = false;
+    try { await fetch(url, { mode: 'no-cors', cache: 'no-store', credentials: 'omit', signal: probe.signal }); reachable = true; }
+    catch (x) {}
+    finally { clearTimeout(timeout); }
+    throw new ConnError(reachable ? 'cors' : 'network', reachable ? 'Google replied but the app is not allowed to read it' : 'Could not reach script.google.com');
+  } finally {
+    clearTimeout(to);
+  }
 }
 function connHelp(kind) {
   if (GAS) return `<p style="margin:0">${kind === 'timeout' ? 'The request timed out.' : 'Could not reach Google.'} Check your internet connection and try again. Your changes are saved on this device and will be sent next time.</p>`;
@@ -704,22 +756,59 @@ function connHelp(kind) {
   };
   return steps[kind] || '';
 }
-async function flush() {
-  if (!CFG.url || !QUEUE.length) return;
-  const sent = QUEUE.slice();
+async function flush(sent) {
+  if (!CFG.url || !sent.length) return;
   const r = await api('batch', { ops: sent });
-  const s = new Set(sent), errs = r.errors || [], bad = new Set(errs.filter(e => /Unknown sheet/.test(e)).map(e => e.split(':')[0]));
-  QUEUE = QUEUE.filter(o => !s.has(o) || bad.has(o.sheet)); persistNow();
-  SYNC.warn = bad.size ? 'Synced, but update Code.gs in Apps Script and redeploy a new version (needed for: ' + [...bad][0] + ')' : '';
-  if (bad.size) toast(SYNC.warn);
-  else if (errs.length) toast('Some changes failed: ' + errs[0]);
+  acknowledgeBatch(sent, r);
+}
+function acknowledgeBatch(sent, result) {
+  const errs = result.errors || [];
+  const bad = new Set(errs.filter(e => /Unknown sheet/.test(e)).map(e => e.split(':')[0]));
+  let acknowledged;
+  if (Array.isArray(result.failedOps)) {
+    const failed = new Set(result.failedOps);
+    acknowledged = new Set(sent.filter((_, index) => !failed.has(index)));
+  } else {
+    // Legacy replies report errors by sheet only. Retain writes that may have failed.
+    const failedSheets = new Set(errs.map(error => error.split(':')[0]));
+    acknowledged = new Set(sent.filter(op => !failedSheets.has(op.sheet)));
+  }
+  const pending = QUEUE.filter(op => !acknowledged.has(op));
+  if (pending.length !== QUEUE.length) {
+    QUEUE = pending;
+    queueDirty = true;
+    persistNow();
+  }
+  if (errs.length) {
+    SYNC.warn = bad.size ? 'Update Code.gs in Apps Script to sync the pending changes.'
+      : 'Some changes could not be saved and are still pending.';
+    toast(SYNC.warn);
+  }
+}
+async function pullSnapshot(sent) {
+  if (sent.length && combinedSync !== false) {
+    let result;
+    try { result = await api('sync', { ops: sent }); }
+    catch (e) {
+      if (e.message !== 'Unknown action') throw e;
+      combinedSync = false;
+    }
+    if (result) {
+      combinedSync = true;
+      acknowledgeBatch(sent, result);
+      if (result.snapshotError) throw new Error(result.snapshotError);
+      return result.data;
+    }
+  }
+  await flush(sent);
+  return (await api('getAll')).data;
 }
 function applyServer(d) {
   const nd = emptyDB();
   Object.keys(TABLES).forEach(k => { nd[TABLES[k]] = d[TABLES[k]] !== undefined ? d[TABLES[k]] : (DB[TABLES[k]] || []); });
   nd.settings = d.settings || {};
   QUEUE.forEach(op => applyOp(nd, op));
-  DB = nd; ver++; persistNow();
+  DB = nd; ver++; persistSoon();
 }
 function scheduleSync() { if (!CFG.url) { setSync('idle'); return; } setSync('pend'); clearTimeout(syncT); syncT = setTimeout(() => sync(), 2000); }
 let busyN = 0, busyT = null;
@@ -756,15 +845,20 @@ async function sync(manual, block) {
   }
   if (GAS && !CFG.key) { setSync('err', 'Access key needed'); render(); keyPrompt(false); return; }
   const lock = !!(block || manual);
+  const started = performance.now(), sent = QUEUE.slice();
+  let status = 'failed';
   syncing = true; setSync('syncing');
+  SYNC.warn = '';
   if (lock) setBusy(true, 'Syncing with your Google Sheet…');
   try {
-    await flush();
-    const r = await api('getAll'); applyServer(r.data);
+    const data = await pullSnapshot(sent);
+    measureLocal('Browser · merge Sheet data', () => applyServer(data));
     seedIfNeeded(); ensureColors(); processPlanned();
-    await flush();
+    const attempted = new Set(sent);
+    await flush(QUEUE.filter(op => !attempted.has(op)));
     META.last = Date.now(); LS.set('ft_meta', META);
-    setSync('ok'); if (manual) toast(SYNC.warn || 'Synced');
+    status = SYNC.warn ? 'partial' : 'ok';
+    setSync(SYNC.warn ? 'err' : 'ok', SYNC.warn); if (manual) toast(SYNC.warn || 'Synced');
   } catch (e) {
     setSync('err', e.message);
     if (e instanceof ConnError && (e.kind === 'badkey' || e.kind === 'nokey')) { CFG.key = ''; saveCfg(); keyPrompt(e.kind === 'badkey'); }
@@ -772,6 +866,7 @@ async function sync(manual, block) {
   } finally {
     syncing = false;
     if (lock) setBusy(false);
+    logPerformance('Sync · total', performance.now() - started, status);
   }
   render();
 }
@@ -881,6 +976,7 @@ function renderHeader() {
   document.title = (n ? `(${n}) ` : '') + 'Finance Tracker';
 }
 function render() {
+  const started = performance.now();
   CUR = DB.settings.currency || '₱';
   renderHeader();
   const v = { home: vHome, records: vRecords, planned: vPlanned, debts: vDebts, stats: vStats, settings: vSettings, receipts: vReceipts }[UI.view];
@@ -888,6 +984,7 @@ function render() {
   if (UI.view === 'records') bindRecords();
   if (UI.view === 'receipts') bindReceipts();
   renderNav();
+  logPerformance('Render · ' + UI.view, performance.now() - started);
 }
 function go(view, o = {}) {
   const stat = o.stat || UI.stat;
@@ -1185,6 +1282,7 @@ function vSettings() {
    <label class="fld"><span>Access key (API_KEY in Script Properties)</span><input type="password" id="s-key" value="${esc(CFG.key)}" autocomplete="off"></label>
    <div class="row" style="margin-bottom:12px"><button class="btn pri" data-act="saveconn">${GAS ? 'Save key' : 'Save & connect'}</button><button class="btn" data-act="syncnow">${ic('sync', 20)}Sync now</button></div>
    <small>${sub}<br>Pending changes: ${QUEUE.length}<br>Auto-sync: when the app opens or refreshes, and every hour while it is open.</small></div>
+  <div class="card"><button class="btn sm" data-act="showperformance">${ic('trend', 18)}Show performance log</button></div>
   <div class="card"><h3>Tools</h3><div class="row" style="flex-wrap:wrap"><button class="btn sm" data-act="backup">${ic('download', 18)}Download backup</button>${CFG.url ? '' : `<button class="btn sm" data-act="sample">Load sample data</button>`}<button class="btn sm danger" data-act="wipe">Clear this device</button></div><small style="display:block;margin-top:10px">“Clear this device” removes the local copy and unsent changes. Data already in your Google Sheet is not touched.</small></div>`;
 }
 ACT.tplsort = () => { DB.templates.slice().sort((a, b) => a.name.localeCompare(b.name)).forEach((t, i) => { if (t.order !== i) up('Templates', { ...t, order: i }); }); render(); toast('Sorted A–Z'); };
@@ -1193,6 +1291,7 @@ ACT.cattab = t => { UI.catTab = t.dataset.t; render(); };
 CHG.autohide = t => { AUTOHIDE = Number(t.value) || 0; LS.set('ft_autohide', AUTOHIDE); toast(AUTOHIDE ? `Amounts will hide after ${AUTOHIDE} min away` : 'Auto-hide is off'); };
 CHG.cur = t => { setSetting('currency', t.value.trim() || '₱'); render(); };
 ACT.saveconn = async () => {
+  if (syncing) return toast('Wait for the current sync to finish.');
   if (GAS) {
     const k = $('#s-key').value.trim(); if (!k) return toast('Enter the access key');
     CFG.key = k; saveCfg(); return sync(true);
@@ -1211,7 +1310,37 @@ ACT.saveconn = async () => {
   }
 };
 ACT.backup = () => { const blob = new Blob([JSON.stringify(DB, null, 2)], { type: 'application/json' }); const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `finance-backup-${today()}.json`; a.click(); };
-ACT.wipe = () => confirmDlg('Remove all data stored on this device, including changes not yet synced?', 'Clear', () => { ['ft_db', 'ft_queue', 'ft_meta', 'ft_banner', 'ft_mask', 'ft_left'].forEach(LS.del); location.reload(); });
+ACT.wipe = () => confirmDlg('Remove all data stored on this device, including changes not yet synced?', 'Clear', () => {
+  clearTimeout(persistT);
+  dbDirty = queueDirty = false;
+  ['ft_db', 'ft_queue', 'ft_meta', 'ft_banner', 'ft_mask', 'ft_left'].forEach(LS.del);
+  location.reload();
+});
+
+function showPerformanceLog() {
+  const dialog = sheet('Performance log',
+    '<p class="mut">Recent timings from this session. Browser wait includes the network and any server work listed below.</p><p data-perf-status></p><div data-perf-entries></div>',
+    '<button class="btn" data-perf-refresh>Refresh</button><button class="btn" data-perf-copy>Copy log</button><button class="btn pri" data-act="lclose">Done</button>');
+  function refresh() {
+    $('[data-perf-status]', dialog).textContent = syncing ? 'Sync is running…' : '';
+    $('[data-perf-entries]', dialog).innerHTML = performanceLog.slice().reverse().map(entry =>
+      `<div class="item"><div class="mid"><b style="white-space:normal">${esc(entry.stage)}</b><small>${esc(new Date(entry.at).toLocaleTimeString())} · ${esc(entry.status)}${entry.characters ? ' · ' + entry.characters.toLocaleString() + ' characters' : ''}</small></div><div class="amt">${entry.ms.toLocaleString()} ms</div></div>`
+    ).join('');
+  }
+  $('[data-perf-refresh]', dialog).onclick = refresh;
+  $('[data-perf-copy]', dialog).onclick = async () => {
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(performanceLog, null, 2));
+      toast('Performance log copied');
+    } catch (err) {
+      toast('Clipboard access is unavailable in this browser');
+    }
+  };
+  refresh();
+  return performanceLog.map(entry => ({ ...entry }));
+}
+ACT.showperformance = showPerformanceLog;
+window.showperformance = showPerformanceLog;
 
 document.addEventListener('pointerdown', e => {
   const h = e.target.closest('.handle'); if (!h) return;
@@ -2388,13 +2517,19 @@ function installKeyboardScrolling() {
     if (e.key === 'ft_mask') { let v = true; try { v = e.newValue === null ? true : JSON.parse(e.newValue) !== false; } catch (x) { } if (v !== MASK.on) { MASK.on = v; render(); } }
     else if (e.key === 'ft_autohide') AUTOHIDE = Number(LS.get('ft_autohide', 0)) || 0;
   });
-  sync(false, true);
-  render();
+  const pageLoad = performance.getEntriesByType('navigation')[0];
+  if (pageLoad?.responseEnd) {
+    if (pageLoad.requestStart) logPerformance('Page · wait for HTML', pageLoad.responseStart - pageLoad.requestStart);
+    logPerformance('Page · download HTML', pageLoad.responseEnd - pageLoad.responseStart);
+  }
+  if (CFG.url) render();
+  sync(false, !META.last);
+  logPerformance('Startup · first view ready', performance.now());
   setInterval(() => sync(), 60 * 60 * 1000);
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState !== 'visible') { LS.set('ft_left', Date.now()); return; }
     awayCheck();
-    if (CFG.url && Date.now() - (META.last || 0) > 60 * 60 * 1000) sync(false, true); else { processPlanned(); render(); }
+    if (CFG.url && Date.now() - (META.last || 0) > 60 * 60 * 1000) sync(false, !META.last); else { processPlanned(); render(); }
   });
   window.addEventListener('online', () => { if (QUEUE.length || CFG.url) sync(); });
   window.addEventListener('keydown', e => { if (e.key === 'Escape' && closeTopLayer()) e.preventDefault(); });
