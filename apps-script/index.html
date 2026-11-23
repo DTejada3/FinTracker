@@ -2599,7 +2599,8 @@ function installKeyboardScrolling() {
 }
 
 const driveAssets = () => new URL('../', location.href);
-const nativeDrive = inAndroidWebView && new URLSearchParams(location.search).get('driveAuth') === '1';
+const driveParams = new URLSearchParams(location.search);
+const nativeDrive = inAndroidWebView && driveParams.get('driveAuth') === '1';
 let nativeAuthRequest;
 window.financeTrackerDriveReady = () => { nativeDriveReady = true; };
 window.financeTrackerDriveToken = (id, token, message) => {
@@ -2639,7 +2640,8 @@ async function initializeDrive() {
     const response = await fetch(new URL('finance-google.json', driveAssets()), { cache: 'no-store' });
     if (!response.ok) throw new Error('Google sign-in setup could not load.');
     const config = await response.json();
-    if (!config.enabled) {
+    const preview = config.testing === true && (nativeDrive || driveProfile || driveParams.get('drivePreview') === '1');
+    if (!config.enabled && !preview) {
       if (driveProfile) showDriveLogin('Google sign-in is temporarily unavailable.');
       return;
     }
