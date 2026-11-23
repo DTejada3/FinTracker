@@ -68,7 +68,7 @@ function handle_(req) {
   if (!req || req.key !== apiKey) return { ok: false, error: 'Invalid API key' };
   const spreadsheetId = props.getProperty('SPREADSHEET_ID');
   if (!spreadsheetId) return { ok: false, error: 'Run setup from the Sheet’s Apps Script editor.' };
-  if (!['ping', 'getAll', 'batch', 'sync', 'pinResetRequest', 'pinResetVerify'].includes(req.action)) {
+  if (!['ping', 'getAll', 'batch', 'sync', 'pinResetRequest', 'pinResetVerify', 'migrationImage'].includes(req.action)) {
     return { ok: false, error: 'Unknown action' };
   }
   function finish(result) {
@@ -82,6 +82,10 @@ function handle_(req) {
     } catch (err) {
       return finish({ ok: false, error: String(err && err.message || err) });
     }
+  }
+  if (req.action === 'migrationImage') {
+    try { return finish(exportTrackerImage_(req.id)); }
+    catch (err) { return finish({ ok: false, error: String(err && err.message || err) }); }
   }
   const lock = LockService.getScriptLock();
   let locked = false;
@@ -347,4 +351,20 @@ function saveImage_(folder, dataUrl, id, size) {
   const file = folder.createFile(blob);
   file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
   return 'https://drive.google.com/thumbnail?id=' + file.getId() + '&sz=w' + (size || 1000);
+}
+
+function exportTrackerImage_(id) {
+  if (typeof id !== 'string' || !/^[-\w]+$/.test(id)) throw new Error('Invalid legacy image reference.');
+  const folders = DriveApp.getFoldersByName(IMAGE_FOLDER);
+  if (!folders.hasNext()) throw new Error('The legacy receipt folder could not be found.');
+  const folderId = folders.next().getId();
+  const file = DriveApp.getFileById(id);
+  const parents = file.getParents();
+  let belongsToTracker = false;
+  while (parents.hasNext()) if (parents.next().getId() === folderId) { belongsToTracker = true; break; }
+  const type = file.getMimeType();
+  if (!belongsToTracker || file.isTrashed() || !/^image\/(?:jpeg|png|webp|gif)$/.test(type) || file.getSize() > 10000000) {
+    throw new Error('This image could not be exported from the legacy tracker folder.');
+  }
+  return { ok: true, contentType: type, base64: Utilities.base64Encode(file.getBlob().getBytes()) };
 }

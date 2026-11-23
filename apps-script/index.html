@@ -306,6 +306,12 @@ hr.sp{border:0;border-top:1px solid #2a2a2e;margin:8px 0}
 #busy .spinner{width:46px;height:46px;border-radius:50%;border:5px solid #ffffff2e;border-top-color:var(--blue);animation:spin .9s linear infinite}
 #busy p{margin:0;color:#fff;font-size:16px}
 #busy button{cursor:pointer}
+#drive-login[hidden],#app[hidden],#nav[hidden]{display:none}
+#drive-login{max-width:440px;margin:0 auto;padding:46px 20px 24px;text-align:center}
+#drive-login img{width:64px;height:64px;border-radius:16px}
+#drive-login h1{margin:12px 0 8px;font-size:28px}
+#drive-login .card{margin:18px 0;text-align:left;overflow-wrap:anywhere}
+#drive-login .btn{min-height:48px}
 
 /* checkbox multi-select filters */
 .ms{position:relative;min-width:0}
@@ -384,6 +390,7 @@ hr.sp{border:0;border-top:1px solid #2a2a2e;margin:8px 0}
 </style>
 </head>
 <body>
+<main id="drive-login" hidden></main>
 <div id="app">
   <header class="hdr" id="hdr"></header>
   <main id="view"></main>
@@ -519,11 +526,16 @@ const GAS = !!(window.google && google.script && google.script.run);
 let CFG = LS.get('ft_cfg', { url: '', key: '' });
 if (GAS) CFG.url = 'gas';
 const saveCfg = () => LS.set('ft_cfg', { url: GAS ? '' : CFG.url, key: CFG.key });
+let driveProfile = GAS ? null : LS.get('ft_drive_profile', null);
+let ledgerStore = null, googleConfig = null, nativeDriveReady = false, legacyDecisionPending = false;
+if (driveProfile) CFG = { url: '', key: '' };
+const cacheKey = name => driveProfile ? 'ft_drive_' + driveProfile.accountId + '_' + name : 'ft_' + name;
+const hasConnection = () => !!(ledgerStore || CFG.url);
 let DB, QUEUE, META;
 measureLocal('Startup · read device cache', () => {
-  DB = Object.assign(emptyDB(), LS.get('ft_db', {}));
-  QUEUE = LS.get('ft_queue', []);
-  META = LS.get('ft_meta', { last: 0 });
+  DB = Object.assign(emptyDB(), LS.get(cacheKey('db'), {}));
+  QUEUE = LS.get(cacheKey('queue'), []);
+  META = LS.get(cacheKey('meta'), { last: 0 });
   QUEUE.forEach(op => applyOp(DB, op));
 });
 let ver = 0;
@@ -532,8 +544,8 @@ let persistT = null, dbDirty = false, queueDirty = false;
 function persistSoon() { dbDirty = true; clearTimeout(persistT); persistT = setTimeout(persistNow, 60); }
 function persistNow() {
   clearTimeout(persistT);
-  if (dbDirty) dbDirty = !measureLocal('Device · save records cache', () => LS.set('ft_db', DB));
-  if (queueDirty) queueDirty = !measureLocal('Device · save pending changes', () => LS.set('ft_queue', QUEUE));
+  if (dbDirty) dbDirty = !measureLocal('Device · save records cache', () => LS.set(cacheKey('db'), DB));
+  if (queueDirty) queueDirty = !measureLocal('Device · save pending changes', () => LS.set(cacheKey('queue'), QUEUE));
   if ((dbDirty || queueDirty) && !persistNow.warned) { persistNow.warned = true; setTimeout(() => toast('This device is out of storage space. Connect your Google Sheet so pictures are saved there.'), 300); }
 }
 window.addEventListener('pagehide', persistNow);
@@ -554,6 +566,7 @@ function applyOp(db, op) {
   }
 }
 function pushOp(op) {
+  op.event = crypto.randomUUID?.() || uid();
   const id = op.row ? op.row.id : op.id;
   QUEUE = QUEUE.filter(o => !(o.sheet === op.sheet && (o.row ? o.row.id : o.id) === id));
   QUEUE.push(op);
@@ -637,7 +650,7 @@ function processPlanned() {
 
 const ACOLORS = ['#5aabf5', '#46c38b', '#f2a03d', '#ef6b6b', '#a98bf0', '#f06fb0', '#35c2d1', '#c7d15a', '#e08c5a', '#8aa0b8', '#7bd88f', '#ff8f6b', '#b388ff', '#4dd0e1', '#ffd54f', '#9ccc65'];
 let ACOL = LS.get('ft_acol', {});
-const accColor = id => { const a = accById(id); return (a && a.color) || ACOL[id] || colorFor(id); };
+const accColor = id => { const a = accById(id), color = a?.color || ACOL[id]; return /^#[0-9a-f]{6}$/i.test(color || '') ? color : colorFor(id); };
 function pickColor() { const used = new Set(DB.accounts.map(a => a.color).filter(Boolean)), free = ACOLORS.filter(c => !used.has(c)), pool = free.length ? free : ACOLORS; return pool[Math.floor(Math.random() * pool.length)]; }
 function ensureColors() {
   let changed = false;
@@ -760,7 +773,8 @@ function connHelp(kind) {
   return steps[kind] || '';
 }
 async function flush(sent) {
-  if (!CFG.url || !sent.length) return;
+  if (!hasConnection() || !sent.length) return;
+  if (ledgerStore) { applyServer(await pullSnapshot(sent)); return; }
   const r = await api('batch', { ops: sent });
   acknowledgeBatch(sent, r);
 }
@@ -789,6 +803,11 @@ function acknowledgeBatch(sent, result) {
   }
 }
 async function pullSnapshot(sent) {
+  if (ledgerStore) {
+    const data = await ledgerStore.sync(sent);
+    acknowledgeBatch(sent, { errors: [] });
+    return data;
+  }
   if (sent.length && combinedSync !== false) {
     let result;
     try { result = await api('sync', { ops: sent }); }
@@ -814,15 +833,15 @@ function applyServer(d) {
   DB = nd; ver++; persistSoon();
 }
 function scheduleSync() {
-  if (!CFG.url) { setSync('idle'); return; }
-  if (syncing || connecting) return;
+  if (!hasConnection()) { setSync('idle'); return; }
+  if (syncing || connecting || legacyDecisionPending) return;
   setSync('pend');
   clearTimeout(syncT);
   syncT = setTimeout(() => sync(), 700);
 }
 function refreshVisible() {
   clearTimeout(visibleRefreshT);
-  if (!CFG.url || !CFG.key || syncing || connecting || navigator.onLine === false ||
+  if (!(ledgerStore || (CFG.url && CFG.key)) || syncing || connecting || legacyDecisionPending || navigator.onLine === false ||
       document.visibilityState !== 'visible' || LAYERS.length ||
       document.activeElement?.matches('#view input, #view select, #view textarea')) return;
   const wait = RESUME_SYNC_GAP_MS - (Date.now() - lastSyncStart);
@@ -840,7 +859,7 @@ function setBusy(on, msg) {
   const sk = $('#busy-skip'); if (sk) sk.style.display = 'none';
   if (active) {
     $('#busy-msg').textContent = msg || 'Loading…';
-    busyT = setTimeout(() => { const s = $('#busy-skip'); if (s && busyN > 0) s.style.display = ''; }, 12000);
+    busyT = setTimeout(() => { const s = $('#busy-skip'); if (s && busyN > 0 && !connecting) s.style.display = ''; }, 12000);
   }
 }
 $('#busy-skip').onclick = () => { busyN = 0; setBusy(false); };
@@ -863,8 +882,13 @@ async function sync(manual, block) {
     return;
   }
   if (connecting) return;
+  if (legacyDecisionPending) {
+    if (manual && googleConfig) showLegacyMigration();
+    return;
+  }
   clearTimeout(syncT);
-  if (!CFG.url) {
+  if (!hasConnection()) {
+    if (driveProfile) { showDriveLogin(); return; }
     seedIfNeeded(); ensureColors(); processPlanned(); render();
     if (manual) toast('Local mode: nothing to sync. Connect a Google Sheet in Settings.');
     return;
@@ -888,19 +912,20 @@ async function sync(manual, block) {
     added.forEach(op => attempted.add(op));
     await flush(added);
     status = SYNC.warn || QUEUE.length ? 'partial' : 'ok';
-    if (status === 'ok') { META.last = Date.now(); LS.set('ft_meta', META); }
+    if (status === 'ok') { META.last = Date.now(); LS.set(cacheKey('meta'), META); }
     setSync(SYNC.warn ? 'err' : QUEUE.length ? 'pend' : 'ok', SYNC.warn);
     if (manual) toast(SYNC.warn || (QUEUE.length ? 'New changes are waiting to sync.' : 'Synced'));
   } catch (e) {
     setSync('err', e.message);
-    if (e instanceof ConnError && (e.kind === 'badkey' || e.kind === 'nokey')) { CFG.key = ''; saveCfg(); keyPrompt(e.kind === 'badkey'); }
+    if (ledgerStore && e.status === 401) { ledgerStore = null; showDriveLogin(e.message); }
+    else if (e instanceof ConnError && (e.kind === 'badkey' || e.kind === 'nokey')) { CFG.key = ''; saveCfg(); keyPrompt(e.kind === 'badkey'); }
     else if (manual) { if (e instanceof ConnError) sheet('Sync failed', connHelp(e.kind), `<button class="btn pri" data-act="lclose">OK</button>`); else toast('Sync failed: ' + (e.message || e)); }
   } finally {
     syncing = false;
     if (lock) setBusy(false);
     logPerformance('Sync · total', performance.now() - started, status);
   }
-  renderAfterSync();
+  if (!driveProfile || ledgerStore) renderAfterSync();
   if (repeatManualSync) {
     repeatManualSync = false;
     sync(true);
@@ -1002,7 +1027,7 @@ function periodUI(key) {
   const modes = [['all', 'All time'], ['year', 'Year'], ['month', 'Month'], ['custom', 'Custom']];
   let extra = '';
   if (p.mode === 'year' || p.mode === 'month') extra = `<div class="pnav"><button class="hbtn" data-act="pnav" data-d="-1">${ic('left')}</button><b>${p.mode === 'year' ? p.year : ML[p.month] + ' ' + p.year}</b><button class="hbtn" data-act="pnav" data-d="1">${ic('right')}</button></div>`;
-  if (p.mode === 'custom') extra = `<div class="pdates"><label class="fld" style="margin:0"><span>From</span><input type="date" value="${p.from}" data-chg="pdate" data-f="from"></label><label class="fld" style="margin:0"><span>To</span><input type="date" value="${p.to}" data-chg="pdate" data-f="to"></label></div>`;
+  if (p.mode === 'custom') extra = `<div class="pdates"><label class="fld" style="margin:0"><span>From</span><input type="date" value="${esc(p.from)}" data-chg="pdate" data-f="from"></label><label class="fld" style="margin:0"><span>To</span><input type="date" value="${esc(p.to)}" data-chg="pdate" data-f="to"></label></div>`;
   return `<div class="period" data-pk="${key}"><div class="seg">${modes.map(([m, l]) => `<button data-act="pmode" data-m="${m}" class="${p.mode === m ? 'on' : ''}">${l}</button>`).join('')}</div>${extra}</div>`;
 }
 const pOf = t => UI.periods[t.closest('[data-pk]').dataset.pk];
@@ -1014,8 +1039,8 @@ const TITLES = { home: 'Home', records: 'Records', planned: 'Planned payments', 
 function renderSyncBtn() {
   const b = $('#syncbtn'); if (!b) return;
   const st = SYNC.state, cls = st === 'ok' ? 'ok' : st === 'err' ? 'err' : (st === 'pend' || QUEUE.length && CFG.url) ? 'pend' : '';
-  b.innerHTML = `<span class="${st === 'syncing' ? 'spin' : ''}" style="display:grid">${ic('sync', 24)}</span>${CFG.url ? `<i class="sync-dot ${cls}"></i>` : ''}`;
-  b.title = st === 'err' ? 'Sync error: ' + SYNC.msg : CFG.url ? 'Sync now' : 'Local mode';
+  b.innerHTML = `<span class="${st === 'syncing' ? 'spin' : ''}" style="display:grid">${ic('sync', 24)}</span>${hasConnection() ? `<i class="sync-dot ${cls}"></i>` : ''}`;
+  b.title = st === 'err' ? 'Sync error: ' + SYNC.msg : hasConnection() ? 'Sync now' : 'Local mode';
 }
 function renderHeader() {
   const n = dueCount();
@@ -1074,7 +1099,7 @@ function recRow(r) {
     cls = r.type === 'income' ? 'inc' : 'exp'; sign = r.type === 'income' ? '+' : '-';
   }
   const lead = r.image ? `<div class="dot sq" style="box-shadow:0 0 0 3px ${c1}"><img loading="lazy" src="${esc(r.image)}" data-act="imgview" data-src="${esc(r.image)}" alt=""></div>` : `<div class="dot" style="background:${bg}">${esc((title.replace(/^\d+(\.\d+)?× /, '')[0] || '?').toUpperCase())}</div>`;
-  return `<div class="item coded" style="--ac:${c1};cursor:pointer" data-act="recopen" data-id="${r.id}">${lead}<div class="mid"><b>${esc(title)}</b><small>${subH}</small></div><div class="amt ${cls}">${sign}${fmt(amt)}</div></div>`;
+  return `<div class="item coded" style="--ac:${c1};cursor:pointer" data-act="recopen" data-id="${esc(r.id)}">${lead}<div class="mid"><b>${esc(title)}</b><small>${subH}</small></div><div class="amt ${cls}">${sign}${fmt(amt)}</div></div>`;
 }
 const sortRecs = a => a.sort((x, y) => y.date.localeCompare(x.date) || String(y.createdAt).localeCompare(String(x.createdAt)));
 const typeIcon = t => (ATYPES[t] || ATYPES.other).i;
@@ -1092,8 +1117,8 @@ function expBanner() {
   const show = UI.expAll ? list : list.slice(0, 3), t = today();
   const rows = show.map(r => {
     const d = daysBetween(t, r.expiryDate);
-    return `<div class="exprow"><div data-act="recopen" data-id="${r.id}" style="cursor:pointer;margin-bottom:8px"><b>${esc(r.item || catName(r))}</b><br><small class="${d <= 0 ? 'neg' : ''}">${expWhen(d)} · ${fmtD(r.expiryDate)}</small></div>
-     <div class="row"><button class="btn" data-act="expdone" data-id="${r.id}" data-s="consumed">Consumed</button><button class="btn" data-act="expdone" data-id="${r.id}" data-s="disposed">Disposed</button><button class="btn pri" data-act="expusing" data-id="${r.id}">Still using</button></div></div>`;
+    return `<div class="exprow"><div data-act="recopen" data-id="${esc(r.id)}" style="cursor:pointer;margin-bottom:8px"><b>${esc(r.item || catName(r))}</b><br><small class="${d <= 0 ? 'neg' : ''}">${expWhen(d)} · ${fmtD(r.expiryDate)}</small></div>
+     <div class="row"><button class="btn" data-act="expdone" data-id="${esc(r.id)}" data-s="consumed">Consumed</button><button class="btn" data-act="expdone" data-id="${esc(r.id)}" data-s="disposed">Disposed</button><button class="btn pri" data-act="expusing" data-id="${esc(r.id)}">Still using</button></div></div>`;
   }).join('');
   const more = list.length > 3 ? `<div style="text-align:center;padding:2px 0 8px"><button class="link" style="font-size:15px" data-act="expmore">${UI.expAll ? 'Show fewer' : `Show all ${list.length}`}</button></div>` : '';
   return `<div class="expbanner"><h4>${ic('clock', 22)}${list.length === 1 ? '1 item is' : list.length + ' items are'} expiring soon</h4><small style="color:#e8cfa3">What happened to ${list.length === 1 ? 'it' : 'each one'}?</small>${rows}${more}</div>`;
@@ -1113,7 +1138,7 @@ function expSnooze(id) {
   const any = opts.some(o => o.ok);
   const body = `<p style="margin:4px 0 14px;line-height:1.45"><b>${esc(r.item || catName(r))}</b><br><small class="${d <= 0 ? 'neg' : ''}">${expWhen(d)} · ${fmtD(r.expiryDate)}</small></p>
    <p style="margin:0 0 12px;line-height:1.45">When should I remind you again?</p>
-   ${opts.map(o => `<button class="btn snz" data-snz="${o.on}" ${o.ok ? '' : 'disabled'}><b>${o.n} days before it expires</b><br><small>${o.ok ? 'Reminder on ' + fmtD(o.on) : 'Too late for this one, that date has passed'}</small></button>`).join('')}
+   ${opts.map(o => `<button class="btn snz" data-snz="${esc(o.on)}" ${o.ok ? '' : 'disabled'}><b>${o.n} days before it expires</b><br><small>${o.ok ? 'Reminder on ' + fmtD(o.on) : 'Too late for this one, that date has passed'}</small></button>`).join('')}
    ${any ? '' : `<button class="btn snz" data-snz="${addDays(t, 1)}"><b>Remind me tomorrow</b><br><small>It is too close to expiry for an earlier reminder</small></button>`}`;
   const dlg = sheet('Still using it', body, `<button class="btn" data-act="lclose">Cancel</button>`);
   dlg.addEventListener('click', e => {
@@ -1128,7 +1153,7 @@ function vHome() {
   let sel = UI.selAcc && accById(UI.selAcc); if (!sel || sel.archived) { sel = null; UI.selAcc = null; }
   const chips = accs.map(a => {
     const cr = isCredit(a), owed = -b[a.id];
-    return `<button class="achip ${cr ? 'cc' : ''} ${a.id === UI.selAcc ? 'sel' : ''} ${a.excluded ? 'exc' : ''}" data-act="selacc" data-id="${a.id}" style="--ac:${accColor(a.id)}"><div class="an">${ic(typeIcon(a.type), 18)}<span>${esc(a.name)}</span></div><div class="av">${cr ? `${fmt(owed)}<small>/ ${fmt0(a.creditLimit)}</small>` : fmt(b[a.id])}</div></button>`;
+    return `<button class="achip ${cr ? 'cc' : ''} ${a.id === UI.selAcc ? 'sel' : ''} ${a.excluded ? 'exc' : ''}" data-act="selacc" data-id="${esc(a.id)}" style="--ac:${accColor(a.id)}"><div class="an">${ic(typeIcon(a.type), 18)}<span>${esc(a.name)}</span></div><div class="av">${cr ? `${fmt(owed)}<small>/ ${fmt0(a.creditLimit)}</small>` : fmt(b[a.id])}</div></button>`;
   }).join('');
   let selTop;
   if (sel) {
@@ -1137,7 +1162,7 @@ function vHome() {
   } else selTop = `<div><span class="lbl">Selected account</span><br><b style="font-size:19px;font-weight:500" class="mut">None selected</b></div><div class="mut" style="font-size:14px;text-align:right">Tap an account<br>to select it</div>`;
   const plans = DB.planned.filter(p => p.active).sort((a, b) => a.nextDue.localeCompare(b.nextDue)).slice(0, 4);
   let recs = DB.records.filter(r => !sel || r.accountId === sel.id || r.toAccountId === sel.id); recs = sortRecs(recs).slice(0, 5);
-  const banner = (!CFG.url && !UI.bannerOff) ? `<div class="banner"><b>Preview mode</b><br>Your data is only stored on this device. Connect your Google Sheet in Settings → Data & Sync to start saving to it.<div class="row"><button class="btn sm" data-act="go" data-v="settings">Open settings</button>${DB.records.length ? '' : `<button class="btn sm" data-act="sample">Load sample data</button>`}<button class="btn sm ghost" data-act="bannerOff">Dismiss</button></div></div>` : '';
+  const banner = (!hasConnection() && !UI.bannerOff) ? `<div class="banner"><b>Preview mode</b><br>Your data is only stored on this device. Connect your Google Sheet in Settings → Data & Sync to start saving to it.<div class="row"><button class="btn sm" data-act="go" data-v="settings">Open settings</button>${DB.records.length ? '' : `<button class="btn sm" data-act="sample">Load sample data</button>`}<button class="btn sm ghost" data-act="bannerOff">Dismiss</button></div></div>` : '';
   return `${expBanner()}${banner}
   <div class="sec"><h2>My Accounts in Wallet</h2><button class="pillbtn" style="padding:8px 12px;border-radius:12px" data-act="go" data-v="settings" title="Manage accounts">${ic('right', 20)}</button></div>
   <div class="grid">${chips}<button class="achip add" data-act="addacc">Add account ${ic('plus', 26)}</button></div>
@@ -1224,7 +1249,7 @@ function vPlanned() {
       <div class="mid"><b style="font-size:18px">${esc(p.name)}${p.autoConfirm ? '<span class="tag">AUTO</span>' : ''}</b><small>${p.type === 'transfer' ? accTag(p.accountId) + ' → ' + accTag(p.toAccountId) : accTag(p.accountId) + (c ? ' · ' + esc(c.name) : '') + (p.payee ? ' · ' + esc(p.payee) : '')}</small></div>
       <div class="amt ${p.type === 'income' ? 'inc' : p.type === 'transfer' ? 'trf' : 'exp'}" style="font-size:18px">${p.type === 'income' ? '+' : p.type === 'transfer' ? '' : '-'}${fmt(p.amount)}</div></div>
      <div class="row" style="margin:2px 0 12px"><div><small>Next due</small><br><b class="${over ? 'neg' : ''}">${fmtD(p.nextDue)}</b> <small class="${over ? 'neg' : ''}">${over ? `· ${-d} day${d === -1 ? '' : 's'} overdue` : now ? '· today' : `· in ${d} day${d === 1 ? '' : 's'}`}</small></div><div style="text-align:right;flex:none"><small>Repeats</small><br>${esc(repLabel(p))}</div></div>
-     <div class="row"><button class="btn ${due ? 'pri' : ''} sm" data-act="plconfirm" data-id="${p.id}">${ic('check', 18)}${due ? 'Confirm' : 'Pay early'}</button><button class="btn sm" data-act="pledit" data-id="${p.id}">${ic('edit', 18)}Edit</button><button class="btn sm danger" style="flex:none" data-act="pldel" data-id="${p.id}">${ic('del', 18)}</button></div></div>`;
+     <div class="row"><button class="btn ${due ? 'pri' : ''} sm" data-act="plconfirm" data-id="${esc(p.id)}">${ic('check', 18)}${due ? 'Confirm' : 'Pay early'}</button><button class="btn sm" data-act="pledit" data-id="${esc(p.id)}">${ic('edit', 18)}Edit</button><button class="btn sm danger" style="flex:none" data-act="pldel" data-id="${esc(p.id)}">${ic('del', 18)}</button></div></div>`;
   }).join('');
   return `<div class="sec"><h2>${list.length} planned</h2><button class="btn sm pri" data-act="newplan">${ic('plus', 18)}New</button></div>
   <div class="pad mut" style="font-size:14px;margin:-4px 0 12px">Sorted by due date. Items marked AUTO are added to your records automatically once due.</div>
@@ -1253,7 +1278,7 @@ function vDebts() {
     const pct = Math.min(100, g.total ? (g.total - g.left) / g.total * 100 : 0), over = g.open && g.due && g.due < today();
     return `<div class="card" style="margin-top:0;${g.open ? '' : 'opacity:.65'}"><div class="row"><div><b style="font-size:19px">${esc(g.person)}</b>${g.items.length > 1 ? `<span class="tag">${g.items.length} debts</span>` : ''}${g.open ? '' : '<span class="tag">SETTLED</span>'}${over ? '<span class="tag red">OVERDUE</span>' : ''}<br><small>${g.due ? 'Next due ' + fmtD(g.due) : 'No due date'}</small></div><div style="text-align:right;flex:none"><b style="font-size:22px">${fmt(g.left)}</b><br><small>of ${fmt(g.total)}</small></div></div>
      <div class="pbar" style="margin:12px 0 4px"><i style="width:${pct}%"></i></div>
-     ${g.items.map(d => { const left = debtLeft(d); return `<div class="entry"><div class="mid"><b>${esc(d.note || 'No reason given')}</b><small>${fmtDS(d.date)}${d.dueDate ? ' · due ' + fmtDS(d.dueDate) : ''}${left <= 0.004 ? ' · settled' : ''}</small></div><div style="text-align:right;flex:none"><b>${fmt(left)}</b><small style="display:block">of ${fmt(d.amount)}</small></div>${left > 0.004 ? `<button class="hbtn" style="width:38px;height:38px;color:var(--green)" data-act="debtpay" data-id="${d.id}" title="Record payment for this debt">${ic('check', 22)}</button>` : ''}<button class="hbtn" style="width:38px;height:38px" data-act="debtedit" data-id="${d.id}" title="Edit">${ic('edit', 20)}</button></div>`; }).join('')}
+     ${g.items.map(d => { const left = debtLeft(d); return `<div class="entry"><div class="mid"><b>${esc(d.note || 'No reason given')}</b><small>${fmtDS(d.date)}${d.dueDate ? ' · due ' + fmtDS(d.dueDate) : ''}${left <= 0.004 ? ' · settled' : ''}</small></div><div style="text-align:right;flex:none"><b>${fmt(left)}</b><small style="display:block">of ${fmt(d.amount)}</small></div>${left > 0.004 ? `<button class="hbtn" style="width:38px;height:38px;color:var(--green)" data-act="debtpay" data-id="${esc(d.id)}" title="Record payment for this debt">${ic('check', 22)}</button>` : ''}<button class="hbtn" style="width:38px;height:38px" data-act="debtedit" data-id="${esc(d.id)}" title="Edit">${ic('edit', 20)}</button></div>`; }).join('')}
      <div class="row" style="margin-top:12px">${g.open ? `<button class="btn sm pri" data-act="debtpayall" data-p="${esc(g.person)}" data-dir="${tab}">${tab === 'owe' ? 'I paid' : 'They paid'}${g.items.filter(d => debtLeft(d) > 0.004).length > 1 ? ' (all)' : ''}</button>` : ''}<button class="btn sm" data-act="debtadd" data-p="${esc(g.person)}" data-dir="${tab}">${ic('plus', 18)}Add debt</button></div></div>`;
   }).join('');
   return `<div class="sec"><h2>Debts</h2><button class="btn sm pri" data-act="debtnew">${ic('plus', 18)}Record debt</button></div>
@@ -1280,7 +1305,7 @@ function rcpList() {
   if (!list.length) return `<div class="empty">${DB.receipts.length ? 'No receipts match your search.' : 'No receipts yet.<br>Tap “Add receipt” to keep a photo of one.'}</div>`;
   const total = list.reduce((s, r) => s + num(r.amount), 0);
   return `<div class="kpis" style="padding-top:14px"><div class="kpi"><span class="lbl">Receipts</span><b>${list.length}</b></div><div class="kpi"><span class="lbl">Total amount</span><b>${fmt(total)}</b></div></div>
-  <div class="rgrid">${list.slice(0, UI.rcp.limit).map(r => `<div class="rcard" data-act="rcopen" data-id="${r.id}"><div class="rimg">${r.image ? `<img loading="lazy" src="${esc(thumb(r.image, 400))}" alt="">` : ic('receipt', 40)}</div><div class="rbody"><b>${esc(r.title)}</b><small>${fmtD(r.date)}</small>${num(r.amount) ? `<span class="rtot">${fmt(r.amount)}</span>` : ''}</div></div>`).join('')}</div>
+  <div class="rgrid">${list.slice(0, UI.rcp.limit).map(r => `<div class="rcard" data-act="rcopen" data-id="${esc(r.id)}"><div class="rimg">${r.image ? `<img loading="lazy" src="${esc(thumb(r.image, 400))}" alt="">` : ic('receipt', 40)}</div><div class="rbody"><b>${esc(r.title)}</b><small>${fmtD(r.date)}</small>${num(r.amount) ? `<span class="rtot">${fmt(r.amount)}</span>` : ''}</div></div>`).join('')}</div>
   ${list.length > UI.rcp.limit ? `<div style="text-align:center;padding:10px"><button class="btn" data-act="rcmore">Show more (${list.length - UI.rcp.limit} left)</button></div>` : ''}`;
 }
 function vReceipts() {
@@ -1296,16 +1321,16 @@ ACT.rcopen = t => receiptDetail(t.dataset.id);
 
 function vSettings() {
   const accs = activeAccounts(), b = balances(), tab = UI.catTab;
-  const accRows = accs.map(a => `<div class="arow drow" data-id="${a.id}"><div class="handle" title="Drag to reorder">${ic('handle', 26)}</div>
+  const accRows = accs.map(a => `<div class="arow drow" data-id="${esc(a.id)}"><div class="handle" title="Drag to reorder">${ic('handle', 26)}</div>
     <span style="color:${accColor(a.id)}">${ic(typeIcon(a.type), 22)}</span><div class="mid" style="flex:1;min-width:0"><b style="display:block;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(a.name)}${a.excluded ? '<span class="tag or">excluded</span>' : ''}</b><small>${ATYPES[a.type] ? ATYPES[a.type].n : ''} · ${isCredit(a) ? fmt(-b[a.id]) + ' owed / ' + fmt0(a.creditLimit) : fmt(b[a.id])}</small></div>
-    <button class="hbtn" data-act="editacc" data-id="${a.id}">${ic('edit', 22)}</button></div>`).join('');
+    <button class="hbtn" data-act="editacc" data-id="${esc(a.id)}">${ic('edit', 22)}</button></div>`).join('');
   const cats = userCats(tab).map(c => {
     const subs = subsOf(c.id);
-    return `<div class="catrow drow" data-id="${c.id}"><div class="row"><div class="handle" style="flex:none" title="Drag to reorder">${ic('handle', 26)}</div><b style="font-weight:500;font-size:18px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><span class="sw" style="display:inline-block;background:${colorFor(c.id)};margin-right:8px;vertical-align:-1px"></span>${esc(c.name)}</b><div style="flex:none"><button class="hbtn" style="display:inline-grid" data-act="editcat" data-id="${c.id}">${ic('edit', 20)}</button></div></div>
-     <div class="subchips" style="margin-left:38px">${subs.map(s => `<button class="subchip" data-act="editsub" data-id="${s.id}">${esc(s.name)} ${ic('edit', 13)}</button>`).join('')}<button class="subchip add" data-act="newsub" data-cat="${c.id}">+ sub category</button></div></div>`;
+    return `<div class="catrow drow" data-id="${esc(c.id)}"><div class="row"><div class="handle" style="flex:none" title="Drag to reorder">${ic('handle', 26)}</div><b style="font-weight:500;font-size:18px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><span class="sw" style="display:inline-block;background:${colorFor(c.id)};margin-right:8px;vertical-align:-1px"></span>${esc(c.name)}</b><div style="flex:none"><button class="hbtn" style="display:inline-grid" data-act="editcat" data-id="${esc(c.id)}">${ic('edit', 20)}</button></div></div>
+     <div class="subchips" style="margin-left:38px">${subs.map(s => `<button class="subchip" data-act="editsub" data-id="${esc(s.id)}">${esc(s.name)} ${ic('edit', 13)}</button>`).join('')}<button class="subchip add" data-act="newsub" data-cat="${esc(c.id)}">+ sub category</button></div></div>`;
   }).join('');
-  const tpls = DB.templates.slice().sort((a, b) => (a.order || 0) - (b.order || 0) || a.name.localeCompare(b.name)).map(t => `<div class="item drow" data-id="${t.id}"><div class="handle" title="Drag to reorder">${ic('handle', 26)}</div><div class="dot" style="background:${t.type === 'income' ? '#2f8f64' : t.type === 'transfer' ? '#7664bd' : '#3d6fb0'}">${ic(t.type === 'transfer' ? 'swap' : 'list', 22)}</div><div class="mid"><b>${esc(t.name)}</b><small>${esc(tplSummary(t))}</small></div><button class="hbtn" data-act="tpledit" data-id="${t.id}">${ic('edit', 22)}</button></div>`).join('');
-  const sub = CFG.url ? (SYNC.state === 'err' ? `<span class="neg">Last attempt failed: ${esc(SYNC.msg)}</span>` : META.last ? 'Last sync: ' + new Date(META.last).toLocaleString() : 'Not synced yet') : 'Local mode (not connected)';
+  const tpls = DB.templates.slice().sort((a, b) => (a.order || 0) - (b.order || 0) || a.name.localeCompare(b.name)).map(t => `<div class="item drow" data-id="${esc(t.id)}"><div class="handle" title="Drag to reorder">${ic('handle', 26)}</div><div class="dot" style="background:${t.type === 'income' ? '#2f8f64' : t.type === 'transfer' ? '#7664bd' : '#3d6fb0'}">${ic(t.type === 'transfer' ? 'swap' : 'list', 22)}</div><div class="mid"><b>${esc(t.name)}</b><small>${esc(tplSummary(t))}</small></div><button class="hbtn" data-act="tpledit" data-id="${esc(t.id)}">${ic('edit', 22)}</button></div>`).join('');
+  const sub = hasConnection() ? (SYNC.state === 'err' ? `<span class="neg">Last attempt failed: ${esc(SYNC.msg)}</span>` : META.last ? 'Last sync: ' + new Date(META.last).toLocaleString() : 'Not synced yet') : 'Local mode (not connected)';
   return `
   ${installablePage && !appInstalled && !standalone.matches && !navigator.standalone ? `<div class="card"><button class="btn pri full" data-act="installapp">${ic('download', 20)}Install app</button></div>` : ''}
   <div class="sec"><h2>Accounts</h2><button class="btn sm pri" data-act="addacc">${ic('plus', 18)}Add account</button></div>
@@ -1330,12 +1355,16 @@ function vSettings() {
 
   <div class="sec"><h2>Data & Sync</h2></div>
   <div class="card" style="margin-top:0">
+   ${driveProfile ? `<p>Google Drive · ${esc(driveProfile.email || 'Connected Google account')}</p>
+   <p><a class="link" href="https://docs.google.com/spreadsheets/d/${encodeURIComponent(driveProfile.spreadsheetId)}/edit" target="_blank" rel="noopener">Open my spreadsheet</a></p>
+   <button class="btn sm" data-act="syncnow">${ic('sync', 20)}Sync now</button>`
+   : `${googleConfig ? `<button class="btn pri full" data-act="driveconnect">${CFG.key ? 'Move your existing ledger' : 'Sign in with Google'}</button>` : ''}
    ${GAS ? `<small style="display:block;margin-bottom:12px">Connected directly to your Google Sheet. No separate web address is needed.</small>` : `<label class="fld"><span>Apps Script Web App URL</span><input type="url" id="s-url" placeholder="https:&#47;&#47;script.google.com/macros/s/…/exec" value="${esc(CFG.url)}" autocomplete="off"></label>`}
    <label class="fld"><span>Access key (API_KEY in Script Properties)</span><input type="password" id="s-key" value="${esc(CFG.key)}" autocomplete="off"></label>
-   <div class="row" style="margin-bottom:12px"><button class="btn pri" data-act="saveconn">${GAS ? 'Save key' : 'Save & connect'}</button><button class="btn" data-act="syncnow">${ic('sync', 20)}Sync now</button></div>
+   <div class="row" style="margin-bottom:12px"><button class="btn pri" data-act="saveconn">${GAS ? 'Save key' : 'Save & connect'}</button><button class="btn" data-act="syncnow">${ic('sync', 20)}Sync now</button></div>`}
    <small>${sub}<br>Pending changes: ${QUEUE.length}<br>Auto-sync runs on open, on return to the app, and every minute while the app is visible.</small></div>
   <div class="card"><button class="btn sm" data-act="showperformance">${ic('trend', 18)}Show performance log</button></div>
-  <div class="card"><h3>Tools</h3><div class="row" style="flex-wrap:wrap"><button class="btn sm" data-act="backup">${ic('download', 18)}Download backup</button>${CFG.url ? '' : `<button class="btn sm" data-act="sample">Load sample data</button>`}<button class="btn sm danger" data-act="wipe">Clear this device</button></div><small style="display:block;margin-top:10px">“Clear this device” removes the local copy and unsent changes. Data already in your Google Sheet is not touched.</small></div>`;
+  <div class="card"><h3>Tools</h3><div class="row" style="flex-wrap:wrap"><button class="btn sm" data-act="backup">${ic('download', 18)}Download backup</button>${hasConnection() ? '' : `<button class="btn sm" data-act="sample">Load sample data</button>`}<button class="btn sm danger" data-act="wipe">Clear this device</button></div><small style="display:block;margin-top:10px">“Clear this device” removes the local copy and unsent changes. Data already in your Google Sheet is not touched.</small></div>`;
 }
 ACT.tplsort = () => { DB.templates.slice().sort((a, b) => a.name.localeCompare(b.name)).forEach((t, i) => { if (t.order !== i) up('Templates', { ...t, order: i }); }); render(); toast('Sorted A–Z'); };
 ACT.catsort = () => { userCats(UI.catTab).sort((a, b) => a.name.localeCompare(b.name)).forEach((c, i) => { if (c.order !== i) up('Categories', { ...c, order: i }); }); render(); toast('Sorted A–Z'); };
@@ -1370,7 +1399,7 @@ ACT.backup = () => { const blob = new Blob([JSON.stringify(DB, null, 2)], { type
 ACT.wipe = () => confirmDlg('Remove all data stored on this device, including changes not yet synced?', 'Clear', () => {
   clearTimeout(persistT);
   dbDirty = queueDirty = false;
-  ['ft_db', 'ft_queue', 'ft_meta', 'ft_banner', 'ft_mask', 'ft_left'].forEach(LS.del);
+  ['db', 'queue', 'meta'].map(cacheKey).concat('ft_banner', 'ft_mask', 'ft_left').forEach(LS.del);
   location.reload();
 });
 
@@ -1422,10 +1451,10 @@ document.addEventListener('pointerdown', e => {
 document.addEventListener('click', e => { const t = e.target.closest('[data-act]'); if (!t) return; const f = ACT[t.dataset.act]; if (f) f(t, e); });
 document.addEventListener('change', e => { const t = e.target.closest('[data-chg]'); if (!t) return; const f = CHG[t.dataset.chg]; if (f) f(t, e); });
 
-const accOpts = (sel, exclude) => DB.accounts.filter(a => a.id !== exclude && (!a.archived || a.id === sel)).sort((a, b) => (a.order || 0) - (b.order || 0)).map(a => `<option value="${a.id}" ${a.id === sel ? 'selected' : ''}>${esc(a.name)}</option>`).join('');
-const catOpts = (type, sel, allowNew) => `<option value="">Select category</option>` + userCats(type).map(c => `<option value="${c.id}" ${c.id === sel ? 'selected' : ''}>${esc(c.name)}</option>`).join('') + (allowNew ? `<option value="__new">＋ New category…</option>` : '');
+const accOpts = (sel, exclude) => DB.accounts.filter(a => a.id !== exclude && (!a.archived || a.id === sel)).sort((a, b) => (a.order || 0) - (b.order || 0)).map(a => `<option value="${esc(a.id)}" ${a.id === sel ? 'selected' : ''}>${esc(a.name)}</option>`).join('');
+const catOpts = (type, sel, allowNew) => `<option value="">Select category</option>` + userCats(type).map(c => `<option value="${esc(c.id)}" ${c.id === sel ? 'selected' : ''}>${esc(c.name)}</option>`).join('') + (allowNew ? `<option value="__new">＋ New category…</option>` : '');
 const subsOf = catId => DB.subcategories.filter(s => s.categoryId === catId).sort((a, b) => (a.order || 0) - (b.order || 0) || a.name.localeCompare(b.name));
-const subOpts = (catId, sel, allowNew) => `<option value="">None</option>` + subsOf(catId).map(s => `<option value="${s.id}" ${s.id === sel ? 'selected' : ''}>${esc(s.name)}</option>`).join('') + (allowNew && catId ? `<option value="__new">＋ New sub category…</option>` : '');
+const subOpts = (catId, sel, allowNew) => `<option value="">None</option>` + subsOf(catId).map(s => `<option value="${esc(s.id)}" ${s.id === sel ? 'selected' : ''}>${esc(s.name)}</option>`).join('') + (allowNew && catId ? `<option value="__new">＋ New sub category…</option>` : '');
 const fld = (label, inner, req) => `<label class="fld"><span>${label}${req ? ' <i>*</i>' : ''}</span>${inner}</label>`;
 const ensureDebtCat = () => { if (!catById('cat_debt')) up('Categories', { id: 'cat_debt', name: 'Debt & Loans', type: 'system', order: 99 }); };
 
@@ -1495,24 +1524,24 @@ function renderForm() {
     h = fld('Account', `<select id="f-acc">${accOpts(F.accountId)}</select>`, 1)
       + `<div class="fld"><span>Item name <i>*</i></span><div class="sugwrap"><input type="text" id="f-item" value="${esc(F.item)}" placeholder="What did you buy?" autocomplete="off"><div class="sug"></div></div></div>`
       + `<div class="two">${fld('Category', `<select id="f-cat">${catOpts('expense', F.categoryId, true)}</select>`, 1)}${fld('Sub category', `<select id="f-sub">${subOpts(F.categoryId, F.subCategoryId, true)}</select>`)}</div>`
-      + `<div class="two"><div class="fld"><span>Quantity <i>*</i></span><div class="combo"><input type="number" id="f-qty" inputmode="decimal" step="any" min="0" value="${F.qty}"><button type="button" class="cbtn" data-act="qtytoggle">${ic('down')}</button><div class="sug qty">${[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map(n => `<div class="si" data-act="qtypick" data-n="${n}">${n}</div>`).join('')}</div></div></div>${fld('Amount / piece', `<input type="number" id="f-unit" data-sug="unit" inputmode="decimal" step="any" min="0" placeholder="0.00" value="${F.unit}">`, 1)}</div>`
+      + `<div class="two"><div class="fld"><span>Quantity <i>*</i></span><div class="combo"><input type="number" id="f-qty" inputmode="decimal" step="any" min="0" value="${esc(F.qty)}"><button type="button" class="cbtn" data-act="qtytoggle">${ic('down')}</button><div class="sug qty">${[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map(n => `<div class="si" data-act="qtypick" data-n="${n}">${n}</div>`).join('')}</div></div></div>${fld('Amount / piece', `<input type="number" id="f-unit" data-sug="unit" inputmode="decimal" step="any" min="0" placeholder="0.00" value="${esc(F.unit)}">`, 1)}</div>`
       + fld('Total amount (auto)', `<input type="text" id="f-total" readonly>`)
       + `<div class="fld"><span>Payee <i>*</i></span><div class="sugwrap"><input type="text" id="f-payee" value="${esc(F.payee)}" placeholder="Store, person or company" autocomplete="off"><div class="sug"></div></div></div>`
-      + fld('Date', `<input type="date" id="f-date" value="${F.date}">`)
+      + fld('Date', `<input type="date" id="f-date" value="${esc(F.date)}">`)
       + `<div class="fld"><span>Expiry date (optional)</span><div class="row"><input type="date" id="f-exp" value="${esc(F.expiryDate || '')}"><button type="button" class="btn sm" style="flex:none" data-act="expclear">Clear</button></div><small style="display:block;margin-top:5px">You will get a reminder on the Home screen 30 days before.</small></div>`
       + `<div class="fld"><span>Item picture (optional)</span><label class="filebtn" for="f-img">${ic('camera', 24)}Take or choose a picture</label><input type="file" id="f-img" accept="image\x2f*" hidden><div id="f-imgwrap"></div></div>`
       + fld('Note', `<input type="text" id="f-note" data-sug="note" value="${esc(F.note)}" placeholder="Optional" autocomplete="off">`);
   } else if (t === 'income') {
     h = fld('Deposit to account', `<select id="f-acc">${accOpts(F.accountId)}</select>`, 1)
       + `<div class="two">${fld('Source name', `<select id="f-cat">${catOpts('income', F.categoryId, true)}</select>`, 1)}${fld('Sub category', `<select id="f-sub">${subOpts(F.categoryId, F.subCategoryId, true)}</select>`)}</div>`
-      + fld('Amount', `<input type="number" id="f-amount" data-sug="incamt" inputmode="decimal" step="any" min="0" placeholder="0.00" value="${F.amount}">`, 1)
+      + fld('Amount', `<input type="number" id="f-amount" data-sug="incamt" inputmode="decimal" step="any" min="0" placeholder="0.00" value="${esc(F.amount)}">`, 1)
       + `<div class="fld"><span>Received from (optional)</span><div class="sugwrap"><input type="text" id="f-payee" value="${esc(F.payee)}" autocomplete="off"><div class="sug"></div></div></div>`
-      + fld('Date', `<input type="date" id="f-date" value="${F.date}">`) + fld('Note', `<input type="text" id="f-note" data-sug="note" value="${esc(F.note)}" placeholder="Optional" autocomplete="off">`);
+      + fld('Date', `<input type="date" id="f-date" value="${esc(F.date)}">`) + fld('Note', `<input type="text" id="f-note" data-sug="note" value="${esc(F.note)}" placeholder="Optional" autocomplete="off">`);
   } else {
     h = fld('From account', `<select id="f-acc">${accOpts(F.accountId)}</select>`, 1) + fld('To account', `<select id="f-to">${accOpts(F.toAccountId)}</select>`, 1)
-      + fld('Amount', `<input type="number" id="f-amount" data-sug="trfamt" inputmode="decimal" step="any" min="0" placeholder="0.00" value="${F.amount}">`, 1)
+      + fld('Amount', `<input type="number" id="f-amount" data-sug="trfamt" inputmode="decimal" step="any" min="0" placeholder="0.00" value="${esc(F.amount)}">`, 1)
       + `<div class="mut" style="font-size:13.5px;margin:-4px 0 14px">Tip: transferring to a credit card pays down what you owe. Transferring from one card to another moves the balance.</div>`
-      + fld('Date', `<input type="date" id="f-date" value="${F.date}">`) + fld('Note', `<input type="text" id="f-note" data-sug="note" value="${esc(F.note)}" placeholder="Optional" autocomplete="off">`);
+      + fld('Date', `<input type="date" id="f-date" value="${esc(F.date)}">`) + fld('Note', `<input type="text" id="f-note" data-sug="note" value="${esc(F.note)}" placeholder="Optional" autocomplete="off">`);
   }
   if (!F.edit) h += `<button type="button" class="btn full" data-act="tplsave" style="margin-top:4px">${ic('plus', 18)}Save as template</button>`;
   $('#tplbar', FL).style.display = F.edit ? 'none' : 'block';
@@ -1659,7 +1688,7 @@ function accountDetail(id) {
 
 function catSheet(id, o = {}) {
   const c = id ? catById(id) : null, type = c ? c.type : (o.type || UI.catTab || 'expense'), subs = c ? subsOf(c.id) : [];
-  const subsHtml = c ? `<div class="fld"><span>Sub categories ${subs.length > 1 ? '(drag to arrange, tap to edit or delete)' : ''}</span>${subs.length ? `<div id="c-subs" data-kind="sub">${subs.map(s => `<div class="arow drow" data-id="${s.id}" style="background:transparent"><div class="handle">${ic('handle', 24)}</div><b style="flex:1;font-weight:500">${esc(s.name)}</b><button type="button" class="hbtn" style="width:38px;height:38px" data-act="csubedit" data-id="${s.id}" data-cat="${c.id}" title="Edit">${ic('edit', 20)}</button><button type="button" class="hbtn" style="width:38px;height:38px;color:var(--red)" data-act="csubdel" data-id="${s.id}" data-cat="${c.id}" title="Delete">${ic('del', 20)}</button></div>`).join('')}</div>${subs.length > 1 ? '<button type="button" class="btn sm ghost" id="c-subsort">Sort A–Z</button>' : ''}` : '<small>None yet. Add one from the Settings page.</small>'}</div>` : '';
+  const subsHtml = c ? `<div class="fld"><span>Sub categories ${subs.length > 1 ? '(drag to arrange, tap to edit or delete)' : ''}</span>${subs.length ? `<div id="c-subs" data-kind="sub">${subs.map(s => `<div class="arow drow" data-id="${esc(s.id)}" style="background:transparent"><div class="handle">${ic('handle', 24)}</div><b style="flex:1;font-weight:500">${esc(s.name)}</b><button type="button" class="hbtn" style="width:38px;height:38px" data-act="csubedit" data-id="${esc(s.id)}" data-cat="${esc(c.id)}" title="Edit">${ic('edit', 20)}</button><button type="button" class="hbtn" style="width:38px;height:38px;color:var(--red)" data-act="csubdel" data-id="${esc(s.id)}" data-cat="${esc(c.id)}" title="Delete">${ic('del', 20)}</button></div>`).join('')}</div>${subs.length > 1 ? '<button type="button" class="btn sm ghost" id="c-subsort">Sort A–Z</button>' : ''}` : '<small>None yet. Add one from the Settings page.</small>'}</div>` : '';
   const d = sheet(c ? 'Edit category' : 'New category', fld('Name', `<input type="text" id="c-name" value="${esc(c ? c.name : '')}" autocomplete="off">`, 1) + fld('Type', `<select id="c-type" ${o.type && !c ? 'disabled' : ''}><option value="expense" ${type === 'expense' ? 'selected' : ''}>Expense category</option><option value="income" ${type === 'income' ? 'selected' : ''}>Income source</option></select>`) + subsHtml,
     `${c ? `<button class="btn danger" id="c-del" style="flex:none">${ic('del', 18)}</button>` : ''}<button class="btn" data-act="lclose">Cancel</button><button class="btn pri" id="c-save">Save</button>`);
   $('#c-save', d).onclick = () => {
@@ -1675,7 +1704,7 @@ function catSheet(id, o = {}) {
 }
 function subSheet(id, o = {}) {
   const s = id ? subById(id) : null, catId = s ? s.categoryId : (o.catId || '');
-  const opt = (type, l) => `<optgroup label="${l}">${userCats(type).map(c => `<option value="${c.id}" ${c.id === catId ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}</optgroup>`;
+  const opt = (type, l) => `<optgroup label="${l}">${userCats(type).map(c => `<option value="${esc(c.id)}" ${c.id === catId ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}</optgroup>`;
   const d = sheet(s ? 'Edit sub category' : 'New sub category', fld('Parent category', `<select id="s-cat"><option value="">Select category</option>${opt('expense', 'Expense')}${opt('income', 'Income')}</select>`, 1) + fld('Name', `<input type="text" id="s-name" value="${esc(s ? s.name : '')}" autocomplete="off">`, 1),
     `${s ? `<button class="btn danger" id="s-del" style="flex:none">${ic('del', 18)}</button>` : ''}<button class="btn" data-act="lclose">Cancel</button><button class="btn pri" id="s-save">Save</button>`);
   $('#s-save', d).onclick = () => {
@@ -1699,12 +1728,12 @@ function planFields() {
     + fld('Name', `<input type="text" data-ps="name" data-sug="pname" value="${esc(T.name)}" placeholder="${tr ? 'e.g. Credit card payment' : 'e.g. Rent, Netflix, Salary'}" autocomplete="off">`, 1)
     + fld(tr ? 'From account' : 'Account', `<select data-ps="accountId">${accOpts(T.accountId)}</select>`, 1);
   if (tr) h += fld('To account', `<select data-ps="toAccountId">${accOpts(T.toAccountId, T.accountId)}</select>`, 1)
-    + fld('Amount', `<input type="number" data-ps="amount" data-sug="pamt" inputmode="decimal" step="any" min="0" value="${T.amount}" placeholder="0.00">`, 1);
+    + fld('Amount', `<input type="number" data-ps="amount" data-sug="pamt" inputmode="decimal" step="any" min="0" value="${esc(T.amount)}" placeholder="0.00">`, 1);
   else h += `<div class="two">${fld('Category', `<select data-ps="categoryId">${catOpts(T.type, T.categoryId)}</select>`, 1)}${fld('Sub category', `<select data-ps="subCategoryId" id="ps-sub">${subOpts(T.categoryId, T.subCategoryId)}</select>`)}</div>`
-    + `<div class="two">${fld('Amount', `<input type="number" data-ps="amount" data-sug="pamt" inputmode="decimal" step="any" min="0" value="${T.amount}" placeholder="0.00">`, 1)}${fld('Payee', `<input type="text" data-ps="payee" data-sug="payee" value="${esc(T.payee)}" autocomplete="off">`)}</div>`;
-  h += fld(T.edit ? 'Next due date' : 'First due date', `<input type="date" data-ps="nextDue" value="${T.nextDue}">`, 1)
+    + `<div class="two">${fld('Amount', `<input type="number" data-ps="amount" data-sug="pamt" inputmode="decimal" step="any" min="0" value="${esc(T.amount)}" placeholder="0.00">`, 1)}${fld('Payee', `<input type="text" data-ps="payee" data-sug="payee" value="${esc(T.payee)}" autocomplete="off">`)}</div>`;
+  h += fld(T.edit ? 'Next due date' : 'First due date', `<input type="date" data-ps="nextDue" value="${esc(T.nextDue)}">`, 1)
     + fld('Repeat', `<select data-ps="repeat">${Object.entries(REPEATS).map(([k, l]) => `<option value="${k}" ${T.repeat === k ? 'selected' : ''}>${l}</option>`).join('')}</select>`);
-  if (T.repeat === 'custom') h += fld('Repeat every how many days?', `<input type="number" data-ps="customDays" data-sug="days" inputmode="numeric" min="1" step="1" value="${T.customDays}">`);
+  if (T.repeat === 'custom') h += fld('Repeat every how many days?', `<input type="number" data-ps="customDays" data-sug="days" inputmode="numeric" min="1" step="1" value="${esc(T.customDays)}">`);
   return h + `<label class="chk"><input type="checkbox" data-ps="autoConfirm" ${T.autoConfirm ? 'checked' : ''}><div>Auto confirm<small>When due, it is added to your records automatically. Leave unchecked to confirm each ${tr ? 'transfer' : 'payment'} yourself.</small></div></label>`
     + fld('Note', `<input type="text" data-ps="note" data-sug="note" value="${esc(T.note)}" placeholder="Optional" autocomplete="off">`);
 }
@@ -1741,7 +1770,7 @@ function planSheet(id) {
 function planConfirm(id) {
   const p = DB.planned.find(x => x.id === id); if (!p) return; const tr = p.type === 'transfer';
   const body = `<p style="margin:0 0 14px;line-height:1.4">Has <b>${esc(p.name)}</b> (due ${fmtD(p.nextDue)}) been ${p.type === 'income' ? 'received' : tr ? 'transferred' : 'paid'}? Confirming adds it to your records.</p>`
-    + fld('Date', `<input type="date" id="pc-date" value="${p.nextDue <= today() ? p.nextDue : today()}">`) + fld('Amount', `<input type="number" id="pc-amt" data-sug="pamt" inputmode="decimal" step="any" value="${p.amount}">`)
+    + fld('Date', `<input type="date" id="pc-date" value="${esc(p.nextDue <= today() ? p.nextDue : today())}">`) + fld('Amount', `<input type="number" id="pc-amt" data-sug="pamt" inputmode="decimal" step="any" value="${esc(p.amount)}">`)
     + fld(tr ? 'From account' : 'Account', `<select id="pc-acc">${accOpts(p.accountId)}</select>`) + (tr ? fld('To account', `<select id="pc-to">${accOpts(p.toAccountId)}</select>`) : '');
   const d = sheet('Confirm ' + (tr ? 'transfer' : 'payment'), body, `<button class="btn" id="pc-skip">Skip this one</button><button class="btn pri" id="pc-ok">${ic('check', 18)}Confirm</button>`);
   $('#pc-ok', d).onclick = () => {
@@ -1821,15 +1850,15 @@ function tplFields() {
   if (T.type === 'expense') h += fld('Account', `<select data-ts="accountId">${A(T.accountId, 'Use the selected / default account')}</select>`)
     + fld('Item name', `<input type="text" data-ts="item" data-sug="item" value="${esc(T.item)}" autocomplete="off">`)
     + `<div class="two">${fld('Category', `<select data-ts="categoryId">${catOpts('expense', T.categoryId)}</select>`)}${fld('Sub category', `<select data-ts="subCategoryId" id="ts-sub">${subOpts(T.categoryId, T.subCategoryId)}</select>`)}</div>`
-    + `<div class="two">${fld('Quantity', `<input type="number" data-ts="qty" inputmode="decimal" step="any" min="0" value="${T.qty}">`)}${fld('Amount / piece', `<input type="number" data-ts="amount" data-sug="unit" inputmode="decimal" step="any" min="0" value="${T.amount}">`)}</div>`
+    + `<div class="two">${fld('Quantity', `<input type="number" data-ts="qty" inputmode="decimal" step="any" min="0" value="${esc(T.qty)}">`)}${fld('Amount / piece', `<input type="number" data-ts="amount" data-sug="unit" inputmode="decimal" step="any" min="0" value="${esc(T.amount)}">`)}</div>`
     + fld('Payee', `<input type="text" data-ts="payee" data-sug="payee" value="${esc(T.payee)}" autocomplete="off">`);
   else if (T.type === 'income') h += fld('Deposit to account', `<select data-ts="accountId">${A(T.accountId, 'Use the selected / default account')}</select>`)
     + `<div class="two">${fld('Source name', `<select data-ts="categoryId">${catOpts('income', T.categoryId)}</select>`)}${fld('Sub category', `<select data-ts="subCategoryId" id="ts-sub">${subOpts(T.categoryId, T.subCategoryId)}</select>`)}</div>`
-    + fld('Amount', `<input type="number" data-ts="amount" data-sug="incamt" inputmode="decimal" step="any" min="0" value="${T.amount}">`)
+    + fld('Amount', `<input type="number" data-ts="amount" data-sug="incamt" inputmode="decimal" step="any" min="0" value="${esc(T.amount)}">`)
     + fld('Received from', `<input type="text" data-ts="payee" data-sug="payee" value="${esc(T.payee)}" autocomplete="off">`);
   else h += fld('From account', `<select data-ts="accountId">${A(T.accountId, 'Use the selected / default account')}</select>`)
     + fld('To account', `<select data-ts="toAccountId">${A(T.toAccountId, 'Choose each time')}</select>`)
-    + fld('Amount', `<input type="number" data-ts="amount" data-sug="trfamt" inputmode="decimal" step="any" min="0" value="${T.amount}">`);
+    + fld('Amount', `<input type="number" data-ts="amount" data-sug="trfamt" inputmode="decimal" step="any" min="0" value="${esc(T.amount)}">`);
   return h + fld('Note', `<input type="text" data-ts="note" data-sug="note" value="${esc(T.note)}" placeholder="Optional">`);
 }
 function templateSheet(id, seed) {
@@ -1859,7 +1888,7 @@ ACT.tplsave = () => {
 };
 ACT.tplopen = () => {
   const list = DB.templates.slice().sort((a, b) => (a.order || 0) - (b.order || 0) || a.name.localeCompare(b.name));
-  const body = list.length ? list.map(t => `<div class="item" data-act="tplpick" data-id="${t.id}" style="cursor:pointer"><div class="dot" style="background:${t.type === 'income' ? '#2f8f64' : t.type === 'transfer' ? '#7664bd' : '#3d6fb0'}">${ic(t.type === 'transfer' ? 'swap' : 'list', 22)}</div><div class="mid"><b>${esc(t.name)}</b><small>${esc(tplSummary(t))}</small></div><span class="tag">${t.type}</span></div>`).join('')
+  const body = list.length ? list.map(t => `<div class="item" data-act="tplpick" data-id="${esc(t.id)}" style="cursor:pointer"><div class="dot" style="background:${t.type === 'income' ? '#2f8f64' : t.type === 'transfer' ? '#7664bd' : '#3d6fb0'}">${ic(t.type === 'transfer' ? 'swap' : 'list', 22)}</div><div class="mid"><b>${esc(t.name)}</b><small>${esc(tplSummary(t))}</small></div><span class="tag">${esc(t.type)}</span></div>`).join('')
     : `<div class="empty">No templates yet.<br>Create them in Settings → Templates, or tap “Save as template” at the bottom of this form.</div>`;
   sheet('Templates', body);
 };
@@ -1882,7 +1911,7 @@ function receiptSheet(id, seed) {
   RS = x ? { ...x } : { title: '', date: today(), amount: '', note: '', image: '', recordId: '', ...(seed || {}) };
   const body = `<div class="fld"><span>Receipt picture <i>*</i></span><label class="filebtn" for="rc-img">${ic('camera', 24)}Take or choose a photo</label><input type="file" id="rc-img" accept="image\x2f*" hidden><div id="rc-prev"></div></div>`
     + fld('Store or title', `<input type="text" id="rc-title" data-sug="rtitle" value="${esc(RS.title)}" placeholder="e.g. SM Supermarket" autocomplete="off">`, 1)
-    + `<div class="two">${fld('Date', `<input type="date" id="rc-date" value="${RS.date}">`)}${fld('Total amount', `<input type="number" id="rc-amt" inputmode="decimal" step="any" min="0" value="${RS.amount}" placeholder="Optional">`)}</div>`
+    + `<div class="two">${fld('Date', `<input type="date" id="rc-date" value="${esc(RS.date)}">`)}${fld('Total amount', `<input type="number" id="rc-amt" inputmode="decimal" step="any" min="0" value="${esc(RS.amount)}" placeholder="Optional">`)}</div>`
     + fld('Note', `<input type="text" id="rc-note" data-sug="note" value="${esc(RS.note)}" placeholder="Optional, e.g. what was bought" autocomplete="off">`)
     + (RS.recordId && DB.records.find(r => r.id === RS.recordId) ? `<small>Linked to the record “${esc(DB.records.find(r => r.id === RS.recordId).item || 'record')}”.</small>` : '');
   const d = sheet(x ? 'Edit receipt' : 'Add receipt', body, `<button class="btn" data-act="lclose">Cancel</button><button class="btn pri" id="rc-save">Save</button>`);
@@ -1914,10 +1943,15 @@ async function downloadReceipt(r) {
   const name = `receipt-${(r.title || 'receipt').replace(/[^\w]+/g, '-').replace(/^-|-$/g, '').toLowerCase().slice(0, 40)}-${r.date}.jpg`;
   const save = blob => { const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 5000); toast('Receipt downloaded'); };
   try {
+    if (r.image.startsWith('drive:')) {
+      if (!ledgerStore) throw new Error('Sign in to download this receipt');
+      return save(await ledgerStore.readImage(r.image));
+    }
     if (r.image.startsWith('data:')) return save(await (await fetch(r.image)).blob());
     const res = await fetch(thumb(r.image, 2000), { mode: 'cors' }); if (!res.ok) throw new Error('blocked');
     save(await res.blob());
   } catch (e) {
+    if (r.image.startsWith('drive:')) return toast('Could not download this receipt from Google Drive.');
     const m = /[?&]id=([^&]+)/.exec(r.image || ''), a = document.createElement('a');
     a.href = m ? `https:\x2f\x2fdrive.google.com/uc?export=download&id=${m[1]}` : r.image; a.target = '_blank'; a.rel = 'noopener'; document.body.appendChild(a); a.click(); a.remove(); toast('Opening the download…');
   }
@@ -2389,6 +2423,7 @@ ACT.pinchange = () => askPin(() => newPinDlg(null, false), { title: 'Current PIN
 
 ACT.pinforgot = t => {
   closeLayer(t && t.closest ? t.closest('.layer') : null);
+  if (driveProfile) return confirmDlg('Sign in with Google again to reset the tracker PIN.', 'Sign in', () => connectDrive(true), false);
   if (!CFG.url) return toast('Email reset needs the app to be connected to your Google Sheet');
   confirmDlg('Forgot your PIN? A 6 digit code will be emailed to the owner of the Google Sheet. Enter it here to reset your PIN, then choose a new one.', 'Email me a code', async () => {
     setBusy(true, 'Sending the code…');
@@ -2563,6 +2598,214 @@ function installKeyboardScrolling() {
   viewport?.addEventListener('scroll', keepInputVisible);
 }
 
+const driveAssets = () => new URL('../', location.href);
+const nativeDrive = inAndroidWebView && new URLSearchParams(location.search).get('driveAuth') === '1';
+let nativeAuthRequest;
+window.financeTrackerDriveReady = () => { nativeDriveReady = true; };
+window.financeTrackerDriveToken = (id, token, message) => {
+  if (nativeAuthRequest?.id !== id) return;
+  const request = nativeAuthRequest;
+  clearTimeout(request.timeout);
+  nativeAuthRequest = null;
+  token ? request.resolve(token) : request.reject(new Error(message || 'Google sign-in did not finish.'));
+};
+function requestDriveToken() {
+  if (!nativeDrive) return FinanceDrive.browserToken(googleConfig.webClientId, driveProfile?.email);
+  if (!nativeDriveReady) throw new Error('Google sign-in is still starting. Try again in a moment.');
+  return new Promise((resolve, reject) => {
+    const id = crypto.randomUUID();
+    const timeout = setTimeout(() => {
+      if (nativeAuthRequest?.id === id) nativeAuthRequest = null;
+      reject(new Error('Google sign-in timed out. Try again.'));
+    }, 120000);
+    nativeAuthRequest = { id, resolve, reject, timeout };
+    location.href = 'fintracker-auth://authorize/' + id;
+  });
+}
+function loadScript(url) {
+  return new Promise((resolve, reject) => {
+    const script = document.createElement('script');
+    script.src = url;
+    script.onload = resolve;
+    script.onerror = () => reject(new Error('Google sign-in could not load. Reload the app and try again.'));
+    document.head.appendChild(script);
+  });
+}
+async function initializeDrive() {
+  if (GAS || (inAndroidWebView && !nativeDrive) ||
+      !/\/(?:home\/|apps-script\/(?:index\.html)?)$/.test(location.pathname)) return;
+  legacyDecisionPending = !!CFG.key;
+  try {
+    const response = await fetch(new URL('finance-google.json', driveAssets()), { cache: 'no-store' });
+    if (!response.ok) throw new Error('Google sign-in setup could not load.');
+    const config = await response.json();
+    if (!config.enabled) {
+      if (driveProfile) showDriveLogin('Google sign-in is temporarily unavailable.');
+      return;
+    }
+    if (!nativeDrive && !/^[-\w]+\.apps\.googleusercontent\.com$/.test(config.webClientId)) {
+      throw new Error('Google sign-in is awaiting configuration.');
+    }
+    if (driveProfile || !CFG.key) showDriveLogin();
+    const scripts = [loadScript(new URL('drive-sync.js', driveAssets()))];
+    if (!nativeDrive) scripts.push(loadScript('https://accounts.google.com/gsi/client'));
+    await Promise.all(scripts);
+    googleConfig = config;
+    if (driveProfile || !CFG.key) showDriveLogin();
+    else {
+      renderAfterSync();
+      if (!LAYERS.length) showLegacyMigration();
+    }
+  } catch (err) {
+    if (driveProfile || $('#drive-login').hidden === false) showDriveLogin(err.message);
+  }
+  finally {
+    if (!googleConfig) legacyDecisionPending = false;
+  }
+}
+function showDriveLogin(message = '') {
+  closeAllLayers();
+  $('#app').hidden = $('#nav').hidden = true;
+  const panel = $('#drive-login');
+  panel.hidden = false;
+  const icon = new URL('apps-script/icon-192.png', driveAssets()).href;
+  panel.innerHTML = `<img src="${esc(icon)}" alt="" width="64" height="64">
+    <h1>Sign in to your tracker</h1>
+    <p class="mut">Open your ledger on any device with the same Google account.</p>
+    <button class="btn pri full" id="drive-sign-in" ${googleConfig ? '' : 'disabled'}>Sign in with Google</button>
+    <div class="card"><b>Financial Tracker Account</b><br><small>Your spreadsheet lives in this folder in your Google Drive.</small></div>
+    ${message ? `<p class="neg" role="status">${esc(message)}</p>` : ''}`;
+  $('#drive-sign-in').onclick = () => connectDrive();
+}
+function showLegacyMigration() {
+  if (!googleConfig || connecting) return;
+  if (!CFG.key) { showDriveLogin(); return; }
+  const dialog = sheet('Move your existing ledger',
+    '<p>Sign in to copy your ledger and pending edits into your own Google Sheet.</p><p><b>Financial Tracker Account</b></p><p class="mut">Your current connection stays active until the copy is verified.</p>',
+    '<button class="btn" id="drive-defer">Keep current sync for now</button><button class="btn pri" id="drive-migrate">Sign in and migrate</button>');
+  $('#drive-migrate', dialog).onclick = () => connectDrive();
+  $('#drive-defer', dialog).onclick = () => {
+    legacyDecisionPending = false;
+    closeLayer(dialog);
+    sync();
+  };
+}
+ACT.driveconnect = showLegacyMigration;
+
+async function readLegacyImage(url) {
+  const source = new URL(url);
+  const id = source.searchParams.get('id');
+  if (source.origin !== 'https://drive.google.com' || source.pathname !== '/thumbnail' || !/^[-\w]+$/.test(id || '')) {
+    throw new Error('A legacy image uses an unsupported link. The old connection was kept.');
+  }
+  const image = await api('migrationImage', { id });
+  return (await fetch('data:' + image.contentType + ';base64,' + image.base64)).blob();
+}
+async function connectDrive(resetPin = false) {
+  if (!googleConfig) return;
+  if (syncing || connecting) return toast('Wait for the current sync to finish.');
+  connecting = true;
+  clearTimeout(syncT);
+  setBusy(true, 'Connecting to Google Drive…');
+  try {
+    const token = await requestDriveToken();
+    const store = new FinanceDrive.LedgerStore(token, logPerformance);
+    const profile = await store.open(driveProfile);
+    const pending = QUEUE.slice();
+    let data;
+    if (!driveProfile) {
+      const legacy = !!(CFG.url && CFG.key);
+      const hasLocalLedger = DB.records.length || DB.receipts.length || DB.planned.length ||
+        DB.debts.length || DB.templates.length || DB.accounts.some(account => account.id !== 'acc_cash');
+      if (legacy || hasLocalLedger) {
+        $('#busy-msg').textContent = 'Copying and verifying your ledger…';
+        const snapshot = legacy ? (await api('getAll')).data : DB;
+        if (!snapshot || !Object.values(TABLES).every(name => Array.isArray(snapshot[name])) ||
+            !snapshot.settings || typeof snapshot.settings !== 'object') throw new Error('The legacy Sheet returned incomplete data. The old connection was kept.');
+        const copy = JSON.parse(JSON.stringify(snapshot));
+        const baseline = legacy ? await FinanceDrive.digest(JSON.stringify(copy)) : 'device';
+        pending.forEach(op => applyOp(copy, op));
+        let migrationSource = CFG.url;
+        if (!legacy) {
+          migrationSource = LS.get('ft_device_migration_source', '') || 'device:' + crypto.randomUUID();
+          if (!LS.set('ft_device_migration_source', migrationSource)) throw new Error('The device could not save migration progress.');
+        }
+        data = await store.migrate(copy, pending, migrationSource, readLegacyImage, baseline);
+      } else data = await store.sync([]);
+
+      const copied = new Set(pending);
+      const remaining = QUEUE.filter(op => !copied.has(op));
+      remaining.forEach(op => applyOp(data, op));
+      const prefix = 'ft_drive_' + profile.accountId + '_';
+      const meta = { last: Date.now() };
+      if (!LS.set(prefix + 'db', data) || !LS.set(prefix + 'queue', remaining) ||
+          !LS.set(prefix + 'meta', meta) || !LS.set('ft_drive_profile', profile)) {
+        throw new Error('The device could not save the new connection. The old connection was kept.');
+      }
+      DB = data; QUEUE = remaining; META = meta; ver++;
+      driveProfile = profile;
+      clearTimeout(persistT);
+      queueDirty = dbDirty = false;
+      CFG = { url: '', key: '' };
+      LS.del('ft_cfg');
+    }
+    ledgerStore = store;
+    legacyDecisionPending = false;
+    closeAllLayers();
+    $('#drive-login').hidden = true;
+    $('#app').hidden = $('#nav').hidden = false;
+    if (resetPin) {
+      setSetting('pinHash', '');
+      setMask(true, true);
+    }
+    connecting = false;
+    render();
+    await sync();
+    if (resetPin && SYNC.state === 'ok') newPinDlg(() => setMask(false, true), true);
+  } catch (err) {
+    if (!driveProfile && CFG.key) toast(err.message);
+    else showDriveLogin(err.message);
+  } finally {
+    connecting = false;
+    setBusy(false);
+  }
+}
+
+const driveImages = new Map();
+const driveImageObserver = new IntersectionObserver(entries => {
+  for (const {target, isIntersecting} of entries) {
+    if (!isIntersecting || !ledgerStore) continue;
+    driveImageObserver.unobserve(target);
+    const ref = target.dataset.driveImage;
+    let url = driveImages.get(ref);
+    if (!url) {
+      url = ledgerStore.readImage(ref).then(blob => URL.createObjectURL(blob)).catch(() => {
+        driveImages.delete(ref);
+        return null;
+      });
+      driveImages.set(ref, url);
+    }
+    url.then(src => { if (src && target.isConnected) target.src = src; });
+  }
+});
+function watchDriveImages() {
+  new MutationObserver(entries => {
+    for (const entry of entries) for (const node of entry.addedNodes) {
+      if (!(node instanceof HTMLElement)) continue;
+      const images = [...node.querySelectorAll('img[src^="drive:"]')];
+      if (node.matches('img[src^="drive:"]')) images.unshift(node);
+      for (const img of images) {
+        img.dataset.driveImage = img.getAttribute('src');
+        img.removeAttribute('src');
+        driveImageObserver.observe(img);
+      }
+    }
+  }).observe(document.body, { childList: true, subtree: true });
+  window.addEventListener('pagehide', event => {
+    if (!event.persisted) for (const url of driveImages.values()) url.then(src => { if (src) URL.revokeObjectURL(src); });
+  });
+}
+
 (function boot() {
   installNavigation();
   installKeyboardScrolling();
@@ -2579,14 +2822,20 @@ function installKeyboardScrolling() {
     if (pageLoad.requestStart) logPerformance('Page · wait for HTML', pageLoad.responseStart - pageLoad.requestStart);
     logPerformance('Page · download HTML', pageLoad.responseEnd - pageLoad.responseStart);
   }
-  if (CFG.url) render();
-  sync(false, !META.last);
+  watchDriveImages();
+  if (driveProfile) showDriveLogin();
+  else if (CFG.url) render();
+  else sync(false, !META.last);
+  initializeDrive().finally(() => {
+    if (CFG.url && !legacyDecisionPending) sync(false, !META.last);
+  });
   logPerformance('Startup · first view ready', performance.now());
   setInterval(refreshVisible, SYNC_POLL_MS);
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState !== 'visible') { LS.set('ft_left', Date.now()); persistNow(); return; }
     const maskChanged = awayCheck();
-    if (!CFG.url) { processPlanned(); render(); }
+    if (driveProfile && !ledgerStore) return;
+    if (!hasConnection()) { processPlanned(); render(); }
     else {
       if (maskChanged) renderAfterSync();
       refreshVisible();
@@ -2594,7 +2843,7 @@ function installKeyboardScrolling() {
   });
   window.addEventListener('focus', refreshVisible);
   window.addEventListener('pageshow', e => { if (e.persisted) refreshVisible(); });
-  window.addEventListener('online', () => { if (CFG.url) sync(); });
+  window.addEventListener('online', () => { if (hasConnection()) sync(); });
   window.addEventListener('keydown', e => { if (e.key === 'Escape' && closeTopLayer()) e.preventDefault(); });
   window.__ft = { get DB() { return DB; }, UI, go, ACT };
   window.__ftReady = true;
