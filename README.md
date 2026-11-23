@@ -1,8 +1,22 @@
 # Finance Tracker
 
-Finance Tracker is a Google Apps Script web app backed by a Google Sheet. Apps Script serves the interface and handles sync, receipt images, and PIN reset emails. GitHub stores the source. Open the Apps Script web app URL to use the tracker.
+Finance Tracker runs on [GitHub Pages](https://dtejada3.github.io/FinTracker/home/). Its Google Drive mode stores each person's ledger and receipt files in their own Drive. The Apps Script instructions below apply to the legacy connection and to exporting existing receipt images for migration.
 
-## Set up the web app
+## Enable Google Drive sign-in
+
+1. In the same Google Cloud project, enable the **Google Drive API** and the **Google Sheets API**. Configure the Google Auth Platform consent screen and add the accounts that will test the app to its test audience.
+2. Create a **Web application** OAuth client. Add `https://dtejada3.github.io` under **Authorized JavaScript origins**. Copy its public client ID into `webClientId` in [finance-google.json](finance-google.json). The browser requests `https://www.googleapis.com/auth/drive.file` and keeps its short-lived access token in memory. [Google's client setup guide](https://developers.google.com/workspace/guides/create-credentials)
+3. For the Android APK, create an **Android** OAuth client in that project for `com.example.financetracker` using the SHA-1 of the certificate that signs the APK. A debug signing certificate and a release signing certificate typically require separate Android clients. Build and install the updated wrapper for native authorization.
+4. If the legacy ledger has uploaded photos, deploy the updated [Code.gs](apps-script/Code.gs) to the existing Apps Script deployment first. Its export endpoint reads images from the tracker’s original Drive folder so the migration can copy them into the user's Drive.
+5. Set `enabled` to `true` in `finance-google.json` and publish to GitHub Pages. Test with the same Google account in a browser and the APK before using the migration with live records.
+
+### Move an existing ledger
+
+Open the app on a device that still has the legacy connection. Choose **Sign in and migrate** and select the Google account that should own the ledger. The app copies the Sheet and pending device edits, checks the copy, then clears the old connection on that device. Repeat on the other devices using the same account. Keep your original Sheet as a reference while you verify the import.
+
+The app looks for **Financial Tracker Account** and **Finance Tracker Ledger** among the files its Google Drive permission can access. The spreadsheet's `Ledger` tab stores individual changes so simultaneous device writes can be read back without replacing the entire Sheet.
+
+## Set up the legacy Apps Script web app
 
 1. Open the target spreadsheet and choose **Extensions → Apps Script**. Paste [Code.gs](apps-script/Code.gs) into the script file. Create an HTML file named `index` and paste [index.html](apps-script/index.html) into it. If the project already has an HTML file that serves the tracker, update that file.
 2. In **Project Settings → Script Properties**, add `API_KEY` with a new, long random value. Set the project time zone to match your spreadsheet. The bundled [manifest](apps-script/appsscript.json) uses `America/Chicago`.
