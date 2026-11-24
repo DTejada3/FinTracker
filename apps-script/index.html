@@ -547,7 +547,7 @@ const TABLES = { Accounts: 'accounts', Categories: 'categories', SubCategories: 
 const emptyDB = () => ({ accounts: [], categories: [], subcategories: [], records: [], planned: [], debts: [], templates: [], receipts: [], settings: {} });
 const GAS = !!(window.google && google.script && google.script.run);
 const managedEndpoint = 'https://script.google.com/macros/s/AKfycbxNBrkv3MuNP_pcBk8r_K6uzaiujoA7zxxxuPBg8pHkKaaBTVWhuLqJy5eCj0l8hYub/exec';
-const managedWebDefault = false;
+const managedWebDefault = true;
 let managedMode = false, managedUrl = managedEndpoint, managedSession = null;
 const unsavedManagedQueues = new Map();
 let CFG = LS.get('ft_cfg', { url: '', key: '' });
