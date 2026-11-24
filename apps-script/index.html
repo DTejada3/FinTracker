@@ -32,20 +32,29 @@ if (installablePage) {
   window.addEventListener('unhandledrejection', function (e) {
     errs.push('Unhandled: ' + ((e.reason && e.reason.message) || e.reason));
   });
-  setTimeout(function () {
-    if (window.__ftReady) return;
+  window.__ftShowStartupError = function (message) {
+    if (document.getElementById('ft-startup-error')) return;
     var d = document.createElement('div');
+    d.id = 'ft-startup-error';
+    d.setAttribute('role', 'alert');
     d.setAttribute('style', 'position:fixed;left:12px;right:12px;top:12px;z-index:99999;background:#3a1212;color:#fff;border:1px solid #ef6b6b;border-radius:12px;padding:14px;font:14px/1.5 system-ui,sans-serif');
     var t = document.createElement('b');
     t.textContent = 'Finance Tracker could not start.';
     var p = document.createElement('div');
     p.style.marginTop = '8px';
-    p.textContent = errs.length ? errs.slice(0, 3).join('  |  ') : 'No error was reported. The page may still be loading, or something is blocking scripts.';
+    p.textContent = message || (errs.length ? errs.slice(0, 3).join('  |  ') : 'The page is still loading or could not start. Reload this page if the message persists.');
     var h = document.createElement('div');
     h.style.cssText = 'margin-top:8px;opacity:.8';
-    h.textContent = 'Send this message to whoever maintains the app. After you redeploy a New version, reload this page.';
+    h.textContent = 'Reload the page to try again.';
     d.appendChild(t); d.appendChild(p); d.appendChild(h);
-    document.body.appendChild(d);
+    (document.body || document.documentElement).appendChild(d);
+  };
+  window.__ftMarkReady = function () {
+    window.__ftReady = true;
+    document.getElementById('ft-startup-error')?.remove();
+  };
+  setTimeout(function () {
+    if (!window.__ftReady) window.__ftShowStartupError();
   }, 4000);
 })();
 </script>
@@ -419,6 +428,7 @@ hr.sp{border:0;border-top:1px solid #2a2a2e;margin:8px 0}
 <section id="managed-restore" hidden>
   <p id="managed-restore-status" role="status"></p>
   <button class="btn" id="managed-restore-retry" type="button" hidden>Try again</button>
+  <button class="btn" id="managed-restore-switch" type="button">Use another account</button>
 </section>
 <div id="app" hidden>
   <header class="hdr" id="hdr"></header>
@@ -516,6 +526,16 @@ const LS = {
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); return true; } catch (e) { return false; } },
   del(k) { try { localStorage.removeItem(k); } catch (e) { } }
 };
+const tabStorage = {
+  get(key, fallback) {
+    try { return JSON.parse(sessionStorage.getItem(key)) ?? fallback; }
+    catch (err) { return fallback; }
+  },
+  set(key, value) {
+    try { sessionStorage.setItem(key, JSON.stringify(value)); return true; }
+    catch (err) { return false; }
+  }
+};
 const performanceLog = [];
 const serverPhases = {
   lock: 'Server · wait for Sheet lock', open: 'Server · open spreadsheet',
@@ -540,12 +560,13 @@ function measureLocal(stage, fn) {
 // Hide-amounts preference. Saved on this device and restored on every launch.
 // Fail-safe: anything other than an explicitly saved `false` (first run, cleared storage, bad value) means hidden.
 MASK.on = LS.get('ft_mask', true) !== false;
-const saveMask = () => LS.set('ft_mask', MASK.on);
+const saveMask = () => LS.set(devicePrefKey('mask'), MASK.on);
 // Optional: re-hide after being away this many minutes (0 = never). Also per device.
 let AUTOHIDE = Number(LS.get('ft_autohide', 0)) || 0;
 // Called on launch and whenever the app comes back to the foreground.
 function awayCheck() {
-  const left = LS.get('ft_left', 0); LS.del('ft_left');
+  const key = devicePrefKey('left');
+  const left = LS.get(key, 0); LS.del(key);
   if (AUTOHIDE && !MASK.on && left && Date.now() - left > AUTOHIDE * 60000) { MASK.on = true; saveMask(); return true; }
   return false;
 }
@@ -555,7 +576,14 @@ const GAS = !!(window.google && google.script && google.script.run);
 const managedEndpoint = 'https://script.google.com/macros/s/AKfycbxNBrkv3MuNP_pcBk8r_K6uzaiujoA7zxxxuPBg8pHkKaaBTVWhuLqJy5eCj0l8hYub/exec';
 const managedWebDefault = true;
 let managedMode = false, managedUrl = managedEndpoint, managedSession = null;
-const managedSessionStorageKey = () => 'ft_saved_session_' + managedUrl;
+let restoringManagedSession = null;
+function managedSessionSurface() {
+  if (GAS) return 'script';
+  if (inAndroidWebView) return 'webview';
+  return standalone.matches || navigator.standalone || driveParams.get('installed') === '1' ? 'installed' : 'browser';
+}
+const legacyManagedSessionKey = () => 'ft_saved_session_' + managedUrl;
+const managedSessionStorageKey = () => legacyManagedSessionKey() + ':' + managedSessionSurface();
 const isManagedToken = token => typeof token === 'string' && /^fts_[a-f0-9]{64}$/.test(token);
 const unsavedManagedQueues = new Map();
 let CFG = LS.get('ft_cfg', { url: '', key: '' });
@@ -566,6 +594,7 @@ let ledgerStore = null, googleConfig = null, nativeDriveReady = false, legacyDec
 if (driveProfile) CFG = { url: '', key: '' };
 const cacheKey = name => managedSession ? 'ft_managed_' + managedSession.accountId + '_' + name
   : driveProfile ? 'ft_drive_' + driveProfile.accountId + '_' + name : 'ft_' + name;
+const devicePrefKey = name => managedSession ? cacheKey(name) : 'ft_' + name;
 const hasConnection = () => !!(managedSession || ledgerStore || CFG.url);
 let reportExclusionUrl = LS.get('ft_report_exclusion_url', '');
 const canSetReportExclusion = () => !CFG.url || reportExclusionUrl === CFG.url;
@@ -1440,7 +1469,7 @@ function vSettings() {
   <div class="sec"><h2>Data & Sync</h2></div>
   <div class="card" style="margin-top:0">
    ${managedSession ? `<p>Signed in as ${esc(managedSession.email)}</p>
-   <div class="row" style="margin-bottom:12px"><button class="btn" data-act="syncnow">${ic('sync', 20)}Sync now</button><button class="btn" data-act="managedout">Sign out</button></div>`
+   <div class="row" style="margin-bottom:12px;flex-wrap:wrap"><button class="btn" data-act="syncnow">${ic('sync', 20)}Sync now</button><button class="btn" data-act="managedswitch">Switch account</button><button class="btn" data-act="managedout">Sign out</button></div>`
    : driveProfile ? `<p>Google Drive · ${esc(driveProfile.email || 'Connected Google account')}</p>
    <p><a class="link" href="https://docs.google.com/spreadsheets/d/${encodeURIComponent(driveProfile.spreadsheetId)}/edit" target="_blank" rel="noopener">Open my spreadsheet</a></p>
    <button class="btn sm" data-act="syncnow">${ic('sync', 20)}Sync now</button>`
@@ -1455,7 +1484,7 @@ function vSettings() {
 ACT.tplsort = () => { DB.templates.slice().sort((a, b) => a.name.localeCompare(b.name)).forEach((t, i) => { if (t.order !== i) up('Templates', { ...t, order: i }); }); render(); toast('Sorted A–Z'); };
 ACT.catsort = () => { userCats(UI.catTab).sort((a, b) => a.name.localeCompare(b.name)).forEach((c, i) => { if (c.order !== i) up('Categories', { ...c, order: i }); }); render(); toast('Sorted A–Z'); };
 ACT.cattab = t => { UI.catTab = t.dataset.t; render(); };
-CHG.autohide = t => { AUTOHIDE = Number(t.value) || 0; LS.set('ft_autohide', AUTOHIDE); toast(AUTOHIDE ? `Amounts will hide after ${AUTOHIDE} min away` : 'Auto-hide is off'); };
+CHG.autohide = t => { AUTOHIDE = Number(t.value) || 0; LS.set(devicePrefKey('autohide'), AUTOHIDE); toast(AUTOHIDE ? `Amounts will hide after ${AUTOHIDE} min away` : 'Auto-hide is off'); };
 CHG.cur = t => { setSetting('currency', t.value.trim() || '₱'); render(); };
 CHG.accountsort = t => {
   if (!ACCOUNT_SORT.has(t.value) || t.value === accountSort()) return;
@@ -1492,7 +1521,7 @@ ACT.backup = () => { const blob = new Blob([JSON.stringify(DB, null, 2)], { type
 ACT.wipe = () => confirmDlg('Remove all data stored on this device, including changes not yet synced?', 'Clear', () => {
   clearTimeout(persistT);
   dbDirty = queueDirty = false;
-  ['db', 'queue', 'meta'].map(cacheKey).concat('ft_banner', 'ft_mask', 'ft_left').forEach(LS.del);
+  ['db', 'queue', 'meta'].map(cacheKey).concat('ft_banner', devicePrefKey('mask'), devicePrefKey('left')).forEach(LS.del);
   location.reload();
 });
 
@@ -2833,7 +2862,7 @@ function endManagedSession(message) {
   F = FL = RS = TS = null;
   pinFails = pinLockUntil = 0;
   MASK.on = true;
-  saveMask();
+  AUTOHIDE = 0;
   Object.assign(UI, newUI());
   saveNavigation({ depth: 0, guarded: navigation.guarded, view: UI.view, stat: UI.stat }, 'replaceState');
   clearProtectedImages();
@@ -2842,10 +2871,17 @@ function endManagedSession(message) {
   $('#managed-form').reset();
   showManagedLogin(message);
 }
-ACT.managedout = () => {
-  if (syncing || connecting) return toast('Wait for the current sync to finish.');
+function canLeaveManagedLedger() {
+  if (syncing || connecting) { toast('Wait for the current sync to finish.'); return false; }
   persistNow();
-  if (queueDirty) return toast('Sync your pending changes before signing out.');
+  if (queueDirty) { toast('Sync your pending changes before leaving this account.'); return false; }
+  return true;
+}
+ACT.managedswitch = () => {
+  if (canLeaveManagedLedger()) endManagedSession();
+};
+ACT.managedout = () => {
+  if (!canLeaveManagedLedger()) return;
   const auth = managedSession;
   endManagedSession();
   if (auth?.token) api('logout', {}, auth).catch(() => {
@@ -2855,7 +2891,20 @@ ACT.managedout = () => {
 
 function forgetManagedSession(token) {
   const key = managedSessionStorageKey();
+  tabStorage.set(key, false);
   if (token && LS.get(key, null)?.token === token) LS.del(key);
+}
+
+function savedManagedSession() {
+  const key = managedSessionStorageKey();
+  const pinned = tabStorage.get(key, null);
+  if (pinned !== null) return pinned;
+  const saved = LS.get(key, null);
+  if (saved || managedSessionSurface() === 'browser') return saved;
+  // The installed app can keep the sign-in saved before browser storage was separated.
+  const oldKey = legacyManagedSessionKey(), legacy = LS.get(oldKey, null);
+  if (isManagedToken(legacy?.token) && LS.set(key, legacy)) LS.del(oldKey);
+  return legacy;
 }
 
 function openManagedLedger(auth, result) {
@@ -2863,6 +2912,9 @@ function openManagedLedger(auth, result) {
       !Object.values(TABLES).every(table => Array.isArray(result.data?.[table])) ||
       !result.data.settings || typeof result.data.settings !== 'object') throw new Error('The server returned an incomplete ledger.');
   managedSession = { ...auth, accountId: result.accountId };
+  MASK.on = LS.get(devicePrefKey('mask'), true) !== false;
+  AUTOHIDE = Number(LS.get(devicePrefKey('autohide'), 0)) || 0;
+  awayCheck();
   QUEUE = unsavedManagedQueues.get(result.accountId) || LS.get(cacheKey('queue'), []);
   queueDirty = unsavedManagedQueues.delete(result.accountId);
   META = LS.get(cacheKey('meta'), { last: 0 });
@@ -2886,16 +2938,19 @@ function showManagedRestore(message, retry) {
 }
 
 async function restoreManagedSession() {
-  if (!managedMode || connecting || managedSession) return;
-  const key = managedSessionStorageKey(), saved = LS.get(key, null);
+  if (!managedMode || connecting || managedSession || restoringManagedSession) return;
+  const key = managedSessionStorageKey(), saved = savedManagedSession();
   if (!isManagedToken(saved?.token) || typeof saved.email !== 'string') return showManagedLogin();
-  connecting = true;
+  tabStorage.set(key, saved);
+  const attempt = {};
+  restoringManagedSession = attempt;
   showManagedRestore('Reconnecting to Finance Tracker…', false);
   try {
     const result = await api('resume', {}, saved);
-    if (LS.get(key, null)?.token !== saved.token) return showManagedLogin();
+    if (restoringManagedSession !== attempt) return;
     openManagedLedger(saved, result);
   } catch (err) {
+    if (restoringManagedSession !== attempt) return;
     if (managedSession) {
       endManagedSession('The saved ledger could not be opened. Sign in again.');
     } else if (err.kind === 'managedauth') {
@@ -2905,7 +2960,7 @@ async function restoreManagedSession() {
       showManagedRestore('Could not reconnect. Check your internet connection and try again.', true);
     }
   } finally {
-    connecting = false;
+    if (restoringManagedSession === attempt) restoringManagedSession = null;
   }
   if (managedSession && QUEUE.length) sync();
 }
@@ -2923,7 +2978,11 @@ async function signInManaged(event) {
     const result = await api('login', { remember: true }, auth);
     const saved = isManagedToken(result.sessionToken) ? { email: auth.email, token: result.sessionToken } : null;
     openManagedLedger(saved || auth, result);
-    if (saved && !LS.set(managedSessionStorageKey(), saved)) toast('This device could not save your sign-in.');
+    if (saved) {
+      const key = managedSessionStorageKey();
+      tabStorage.set(key, saved);
+      if (!LS.set(key, saved)) toast('This device could not save your sign-in.');
+    }
   } catch (err) {
     if (managedSession) endManagedSession();
     $('#managed-key').value = '';
@@ -2958,6 +3017,11 @@ async function configureAccess() {
     Object.assign(UI, newUI());
     $('#managed-form').addEventListener('submit', signInManaged);
     $('#managed-restore-retry').addEventListener('click', restoreManagedSession);
+    $('#managed-restore-switch').addEventListener('click', () => {
+      restoringManagedSession = null;
+      forgetManagedSession();
+      showManagedLogin();
+    });
     await restoreManagedSession();
   } else {
     readDeviceCache();
@@ -3133,11 +3197,11 @@ function watchDriveImages() {
   installKeyboardScrolling();
   CUR = DB.settings.currency || '₱';
   awayCheck();
-  window.addEventListener('pagehide', () => LS.set('ft_left', Date.now()));
+  window.addEventListener('pagehide', () => LS.set(devicePrefKey('left'), Date.now()));
   // keep several open tabs of the app in agreement
   window.addEventListener('storage', e => {
-    if (e.key === 'ft_mask') { let v = true; try { v = e.newValue === null ? true : JSON.parse(e.newValue) !== false; } catch (x) { } if (v !== MASK.on) { MASK.on = v; render(); } }
-    else if (e.key === 'ft_autohide') AUTOHIDE = Number(LS.get('ft_autohide', 0)) || 0;
+    if (e.key === devicePrefKey('mask')) { let v = true; try { v = e.newValue === null ? true : JSON.parse(e.newValue) !== false; } catch (x) { } if (v !== MASK.on) { MASK.on = v; render(); } }
+    else if (e.key === devicePrefKey('autohide')) AUTOHIDE = Number(LS.get(e.key, 0)) || 0;
   });
   const pageLoad = performance.getEntriesByType('navigation')[0];
   if (pageLoad?.responseEnd) {
@@ -3145,11 +3209,14 @@ function watchDriveImages() {
     logPerformance('Page · download HTML', pageLoad.responseEnd - pageLoad.responseStart);
   }
   watchDriveImages();
-  await configureAccess();
+  // Network authentication can take longer than the script-start watchdog.
+  window.__ftMarkReady();
+  try { await configureAccess(); }
+  catch (err) { window.__ftShowStartupError(err.message || 'Could not initialize the tracker.'); return; }
   logPerformance('Startup · first view ready', performance.now());
   setInterval(refreshVisible, SYNC_POLL_MS);
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState !== 'visible') { LS.set('ft_left', Date.now()); persistNow(); return; }
+    if (document.visibilityState !== 'visible') { LS.set(devicePrefKey('left'), Date.now()); persistNow(); return; }
     const maskChanged = awayCheck();
     if ((managedMode && !managedSession) || (driveProfile && !ledgerStore)) return;
     if (!hasConnection()) { processPlanned(); render(); }
@@ -3165,7 +3232,6 @@ function watchDriveImages() {
     else if (hasConnection()) sync();
   });
   window.addEventListener('keydown', e => { if (e.key === 'Escape' && closeTopLayer()) e.preventDefault(); });
-  window.__ftReady = true;
 })();
 
 </script>

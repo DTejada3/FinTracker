@@ -2,7 +2,7 @@
   "id": "../home/",
   "name": "Finance Tracker",
   "short_name": "Finance Tracker",
-  "start_url": "../home/",
+  "start_url": "../home/?installed=1",
   "scope": "../",
   "display": "standalone",
   "background_color": "#121212",
