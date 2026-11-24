@@ -341,6 +341,7 @@ hr.sp{border:0;border-top:1px solid #2a2a2e;margin:8px 0}
 #managed-error{margin:12px 0 0}
 #managed-restore{max-width:400px;margin:auto;padding:25vh 20px 24px;text-align:center}
 #managed-restore .btn{margin-top:14px}
+#managed-restore .btn[hidden]{display:none}
 
 /* checkbox multi-select filters */
 .ms{position:relative;min-width:0}
@@ -539,10 +540,16 @@ const tabStorage = {
     try { return JSON.parse(sessionStorage.getItem(key)) ?? fallback; }
     catch (err) { return fallback; }
   },
-  set(key, value) {
-    try { sessionStorage.setItem(key, JSON.stringify(value)); return true; }
+  set(key, value, maxLength = Infinity) {
+    try {
+      const json = JSON.stringify(value);
+      if (json.length > maxLength) return false;
+      sessionStorage.setItem(key, json);
+      return true;
+    }
     catch (err) { return false; }
-  }
+  },
+  del(key) { try { sessionStorage.removeItem(key); } catch (err) { } }
 };
 const performanceLog = [];
 const serverPhases = {
@@ -789,16 +796,16 @@ let connecting = false, lastSyncStart = 0, visibleRefreshT;
 const SYNC = { state: 'idle', msg: '' };
 function setSync(state, msg = '') { SYNC.state = state; SYNC.msg = msg; if (typeof renderSyncBtn === 'function') renderSyncBtn(); }
 class ConnError extends Error { constructor(kind, msg) { super(msg); this.kind = kind; } }
-function gasCall(body) {
+function gasCall(body, timeoutMs = 90000) {
   return new Promise((resolve, reject) => {
-    const to = setTimeout(() => reject(new ConnError('timeout', 'The request timed out')), 90000);
+    const to = setTimeout(() => reject(new ConnError('timeout', 'The request timed out')), timeoutMs);
     google.script.run
       .withSuccessHandler(s => { clearTimeout(to); resolve(s); })
       .withFailureHandler(err => { clearTimeout(to); reject(new ConnError('network', (err && err.message) || 'Could not reach Google')); })
       .rpc(body);
   });
 }
-async function api(action, payload = {}, auth = managedSession) {
+async function api(action, payload = {}, auth = managedSession, timeoutMs = 90000) {
   const started = performance.now();
   let status = 'failed';
   try {
@@ -816,7 +823,7 @@ async function api(action, payload = {}, auth = managedSession) {
     const network = performance.now();
     let response;
     try {
-      response = await (GAS ? gasCall(body) : fetchScript(body, url));
+      response = await (GAS ? gasCall(body, timeoutMs) : fetchScript(body, url, timeoutMs));
     } finally {
       logPerformance('Browser · wait for ' + action, performance.now() - network, response === undefined ? 'failed' : 'ok', response?.length);
     }
@@ -849,14 +856,15 @@ async function api(action, payload = {}, auth = managedSession) {
     logPerformance('Request · ' + action, performance.now() - started, status);
   }
 }
-async function fetchScript(body, url) {
+async function fetchScript(body, url, timeoutMs) {
   const ctl = new AbortController();
-  const to = setTimeout(() => ctl.abort(), 90000);
+  const to = setTimeout(() => ctl.abort(), timeoutMs);
   try {
     const res = await fetch(url, { method: 'POST', body, redirect: 'follow', credentials: 'omit', signal: ctl.signal });
     return await res.text();
   } catch (e) {
     if (e.name === 'AbortError') throw new ConnError('timeout', 'The request timed out');
+    if (timeoutMs < 90000) throw new ConnError('network', 'Could not reach the tracker');
     const probe = new AbortController();
     const timeout = setTimeout(() => probe.abort(), 3000);
     let reachable = false;
@@ -939,7 +947,13 @@ async function pullSnapshot(sent) {
   await flush(sent);
   return (await api('getAll')).data;
 }
-function applyServer(d) {
+function applyServer(d, rememberSnapshot = true) {
+  // Save the server snapshot before applying unsent changes to its arrays.
+  if (rememberSnapshot && managedSession?.token && isCompleteManagedLedger(d)) {
+    const key = managedLedgerSnapshotKey();
+    const snapshot = { token: managedSession.token, accountId: managedSession.accountId, data: d };
+    if (!tabStorage.set(key, snapshot, 1500000)) tabStorage.del(key);
+  }
   const nd = emptyDB();
   Object.keys(TABLES).forEach(k => { nd[TABLES[k]] = d[TABLES[k]] !== undefined ? d[TABLES[k]] : (DB[TABLES[k]] || []); });
   nd.settings = d.settings || {};
@@ -2923,6 +2937,7 @@ ACT.managedout = () => {
 
 function forgetManagedSession(token) {
   const key = managedSessionStorageKey();
+  tabStorage.del(managedLedgerSnapshotKey());
   tabStorage.set(key, false);
   if (token && LS.get(key, null)?.token === token) LS.del(key);
 }
@@ -2939,10 +2954,14 @@ function savedManagedSession() {
   return legacy;
 }
 
-function openManagedLedger(auth, result) {
-  if (!/^[a-f0-9]{64}$/.test(result.accountId || '') ||
-      !Object.values(TABLES).every(table => Array.isArray(result.data?.[table])) ||
-      !result.data.settings || typeof result.data.settings !== 'object') throw new Error('The server returned an incomplete ledger.');
+const managedLedgerSnapshotKey = () => managedSessionStorageKey() + ':ledger';
+const isCompleteManagedLedger = data => Object.values(TABLES).every(table => Array.isArray(data?.[table])) &&
+  !!data.settings && typeof data.settings === 'object' && !Array.isArray(data.settings);
+
+function openManagedLedger(auth, result, cached = false) {
+  if (!/^[a-f0-9]{64}$/.test(result.accountId || '') || !isCompleteManagedLedger(result.data)) {
+    throw new Error('The server returned an incomplete ledger.');
+  }
   managedSession = { ...auth, accountId: result.accountId };
   MASK.on = LS.get(devicePrefKey('mask'), true) !== false;
   AUTOHIDE = Number(LS.get(devicePrefKey('autohide'), 0)) || 0;
@@ -2950,14 +2969,14 @@ function openManagedLedger(auth, result) {
   QUEUE = unsavedManagedQueues.get(result.accountId) || LS.get(cacheKey('queue'), []);
   queueDirty = unsavedManagedQueues.delete(result.accountId);
   META = LS.get(cacheKey('meta'), { last: 0 });
-  applyServer(result.data);
+  applyServer(result.data, !cached);
   persistNow();
   $('#managed-form').reset();
   $('#managed-login').hidden = $('#managed-restore').hidden = true;
   $('#app').hidden = $('#nav').hidden = false;
   SYNC.warn = '';
-  setSync(QUEUE.length ? 'pend' : 'ok');
-  seedIfNeeded(); ensureColors(); processPlanned();
+  setSync(cached || QUEUE.length ? 'pend' : 'ok');
+  if (!cached) { seedIfNeeded(); ensureColors(); processPlanned(); }
   render();
   if (!GAS) LS.set('ft_managed_connected', true);
 }
@@ -2976,11 +2995,23 @@ async function restoreManagedSession() {
   tabStorage.set(key, saved);
   const attempt = {};
   restoringManagedSession = attempt;
-  showManagedRestore('Reconnecting to Finance Tracker…', false);
+  const stored = tabStorage.get(managedLedgerSnapshotKey(), null);
+  const cached = stored?.token === saved.token && /^[a-f0-9]{64}$/.test(stored.accountId || '') &&
+    isCompleteManagedLedger(stored.data) ? stored : null;
+  const loadingTimer = setTimeout(() => {
+    if (restoringManagedSession === attempt) showManagedRestore('Opening your ledger…', false);
+  }, 700);
   try {
-    const result = await api('resume', {}, saved);
+    let result;
+    if (cached) {
+      // The server still checks the token and its account before cached records are shown.
+      if ((await api('ping', {}, saved, 15000)).pong !== true) throw new Error('Could not verify saved sign-in.');
+      result = cached;
+    } else {
+      result = await api('resume', {}, saved, 25000);
+    }
     if (restoringManagedSession !== attempt) return;
-    openManagedLedger(saved, result);
+    openManagedLedger(saved, result, !!cached);
   } catch (err) {
     if (restoringManagedSession !== attempt) return;
     if (managedSession) {
@@ -2992,9 +3023,10 @@ async function restoreManagedSession() {
       showManagedRestore('Could not reconnect. Check your internet connection and try again.', true);
     }
   } finally {
+    clearTimeout(loadingTimer);
     if (restoringManagedSession === attempt) restoringManagedSession = null;
   }
-  if (managedSession && QUEUE.length) sync();
+  if (managedSession && (cached || QUEUE.length)) sync();
 }
 
 async function signInManaged(event) {
