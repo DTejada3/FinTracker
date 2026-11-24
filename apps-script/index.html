@@ -322,6 +322,8 @@ hr.sp{border:0;border-top:1px solid #2a2a2e;margin:8px 0}
 .managed-signin .btn{min-height:48px}
 .managed-owner{align-self:end;justify-self:end;display:flex;align-items:center;min-height:44px;font-size:14px;color:var(--mut);text-underline-offset:3px}
 #managed-error{margin:12px 0 0}
+#managed-restore{max-width:400px;margin:auto;padding:25vh 20px 24px;text-align:center}
+#managed-restore .btn{margin-top:14px}
 
 /* checkbox multi-select filters */
 .ms{position:relative;min-width:0}
@@ -414,6 +416,10 @@ hr.sp{border:0;border-top:1px solid #2a2a2e;margin:8px 0}
   </div>
   <a class="managed-owner" id="managed-owner" target="_blank" rel="noopener noreferrer">Login as system owner</a>
 </main>
+<section id="managed-restore" hidden>
+  <p id="managed-restore-status" role="status"></p>
+  <button class="btn" id="managed-restore-retry" type="button" hidden>Try again</button>
+</section>
 <div id="app" hidden>
   <header class="hdr" id="hdr"></header>
   <main id="view"></main>
@@ -549,6 +555,8 @@ const GAS = !!(window.google && google.script && google.script.run);
 const managedEndpoint = 'https://script.google.com/macros/s/AKfycbxNBrkv3MuNP_pcBk8r_K6uzaiujoA7zxxxuPBg8pHkKaaBTVWhuLqJy5eCj0l8hYub/exec';
 const managedWebDefault = true;
 let managedMode = false, managedUrl = managedEndpoint, managedSession = null;
+const managedSessionStorageKey = () => 'ft_saved_session_' + managedUrl;
+const isManagedToken = token => typeof token === 'string' && /^fts_[a-f0-9]{64}$/.test(token);
 const unsavedManagedQueues = new Map();
 let CFG = LS.get('ft_cfg', { url: '', key: '' });
 if (GAS) CFG.url = 'gas';
@@ -764,9 +772,10 @@ async function api(action, payload = {}, auth = managedSession) {
       await api('ping');
       if (!canSetReportExclusion()) throw new Error(reportExclusionUpgrade);
     }
-    const body = measureLocal('Browser · encode ' + action, () => JSON.stringify({
-      ...payload, action, key: auth ? auth.key : CFG.key, ...(auth ? { email: auth.email } : {})
-    }));
+    const credentials = auth ? {
+      email: auth.email, ...(auth.token ? { sessionToken: auth.token } : { key: auth.key })
+    } : { key: CFG.key };
+    const body = measureLocal('Browser · encode ' + action, () => JSON.stringify({ ...payload, action, ...credentials }));
     const network = performance.now();
     let response;
     try {
@@ -782,7 +791,9 @@ async function api(action, payload = {}, auth = managedSession) {
       if (Number.isFinite(ms) && ms >= 0) logPerformance(label + ' (' + action + ')', ms, 'measured');
     });
     if (!j.ok) {
-      if (auth && j.code === 'auth') throw new ConnError('managedauth', j.error);
+      if (auth && (j.code === 'auth' || (auth.token && (j.code === 'setup' || j.error === 'Unknown action')))) {
+        throw new ConnError('managedauth', j.error);
+      }
       if (GAS && j.error === 'Invalid API key') throw new ConnError('badkey', 'That access key was not accepted');
       throw new Error(j.error || 'Server error');
     }
@@ -2795,6 +2806,7 @@ async function initializeDrive() {
 }
 function showManagedLogin(message = '') {
   $('#app').hidden = $('#nav').hidden = $('#drive-login').hidden = true;
+  $('#managed-restore').hidden = true;
   $('#managed-login').hidden = false;
   const status = $('#managed-error');
   status.textContent = message;
@@ -2815,6 +2827,7 @@ function endManagedSession(message) {
   clearTimeout(syncT);
   clearTimeout(visibleRefreshT);
   closeAllLayers();
+  forgetManagedSession(managedSession?.token);
   managedSession = null;
   DB = emptyDB(); QUEUE = []; META = { last: 0 }; ver++;
   F = FL = RS = TS = null;
@@ -2833,8 +2846,69 @@ ACT.managedout = () => {
   if (syncing || connecting) return toast('Wait for the current sync to finish.');
   persistNow();
   if (queueDirty) return toast('Sync your pending changes before signing out.');
+  const auth = managedSession;
   endManagedSession();
+  if (auth?.token) api('logout', {}, auth).catch(() => {
+    // The local token is already removed. An unreachable server expires it independently.
+  });
 };
+
+function forgetManagedSession(token) {
+  const key = managedSessionStorageKey();
+  if (token && LS.get(key, null)?.token === token) LS.del(key);
+}
+
+function openManagedLedger(auth, result) {
+  if (!/^[a-f0-9]{64}$/.test(result.accountId || '') ||
+      !Object.values(TABLES).every(table => Array.isArray(result.data?.[table])) ||
+      !result.data.settings || typeof result.data.settings !== 'object') throw new Error('The server returned an incomplete ledger.');
+  managedSession = { ...auth, accountId: result.accountId };
+  QUEUE = unsavedManagedQueues.get(result.accountId) || LS.get(cacheKey('queue'), []);
+  queueDirty = unsavedManagedQueues.delete(result.accountId);
+  META = LS.get(cacheKey('meta'), { last: 0 });
+  applyServer(result.data);
+  persistNow();
+  $('#managed-form').reset();
+  $('#managed-login').hidden = $('#managed-restore').hidden = true;
+  $('#app').hidden = $('#nav').hidden = false;
+  SYNC.warn = '';
+  setSync(QUEUE.length ? 'pend' : 'ok');
+  seedIfNeeded(); ensureColors(); processPlanned();
+  render();
+  if (!GAS) LS.set('ft_managed_connected', true);
+}
+
+function showManagedRestore(message, retry) {
+  $('#managed-login').hidden = $('#app').hidden = $('#nav').hidden = true;
+  $('#managed-restore').hidden = false;
+  $('#managed-restore-status').textContent = message;
+  $('#managed-restore-retry').hidden = !retry;
+}
+
+async function restoreManagedSession() {
+  if (!managedMode || connecting || managedSession) return;
+  const key = managedSessionStorageKey(), saved = LS.get(key, null);
+  if (!isManagedToken(saved?.token) || typeof saved.email !== 'string') return showManagedLogin();
+  connecting = true;
+  showManagedRestore('Reconnecting to Finance Tracker…', false);
+  try {
+    const result = await api('resume', {}, saved);
+    if (LS.get(key, null)?.token !== saved.token) return showManagedLogin();
+    openManagedLedger(saved, result);
+  } catch (err) {
+    if (managedSession) {
+      endManagedSession('The saved ledger could not be opened. Sign in again.');
+    } else if (err.kind === 'managedauth') {
+      forgetManagedSession(saved.token);
+      showManagedLogin('Your saved sign-in has expired or was revoked. Sign in again.');
+    } else {
+      showManagedRestore('Could not reconnect. Check your internet connection and try again.', true);
+    }
+  } finally {
+    connecting = false;
+  }
+  if (managedSession && QUEUE.length) sync();
+}
 
 async function signInManaged(event) {
   event.preventDefault();
@@ -2846,25 +2920,10 @@ async function signInManaged(event) {
   button.textContent = 'Signing in…';
   showManagedLogin();
   try {
-    const result = await api('login', {}, auth);
-    if (!/^[a-f0-9]{64}$/.test(result.accountId || '') ||
-        !Object.values(TABLES).every(table => Array.isArray(result.data?.[table])) ||
-        !result.data.settings || typeof result.data.settings !== 'object') throw new Error('The server returned an incomplete ledger.');
-    managedSession = { ...auth, accountId: result.accountId };
-    QUEUE = unsavedManagedQueues.get(result.accountId) || LS.get(cacheKey('queue'), []);
-    queueDirty = unsavedManagedQueues.delete(result.accountId);
-    META = LS.get(cacheKey('meta'), { last: 0 });
-    applyServer(result.data);
-    persistNow();
-    form.reset();
-    $('#managed-login').hidden = true;
-    $('#app').hidden = $('#nav').hidden = false;
-    SYNC.warn = '';
-    setSync(QUEUE.length ? 'pend' : 'ok');
-    seedIfNeeded(); ensureColors(); processPlanned();
-    render();
-    if (!GAS) LS.set('ft_managed_connected', true);
-    if (QUEUE.length) { connecting = false; sync(); }
+    const result = await api('login', { remember: true }, auth);
+    const saved = isManagedToken(result.sessionToken) ? { email: auth.email, token: result.sessionToken } : null;
+    openManagedLedger(saved || auth, result);
+    if (saved && !LS.set(managedSessionStorageKey(), saved)) toast('This device could not save your sign-in.');
   } catch (err) {
     if (managedSession) endManagedSession();
     $('#managed-key').value = '';
@@ -2875,6 +2934,7 @@ async function signInManaged(event) {
     button.disabled = false;
     button.textContent = 'Sign In';
   }
+  if (managedSession && QUEUE.length) sync();
 }
 
 async function configureAccess() {
@@ -2896,8 +2956,9 @@ async function configureAccess() {
     CFG = { url: '', key: '' };
     driveProfile = null;
     Object.assign(UI, newUI());
-    showManagedLogin();
     $('#managed-form').addEventListener('submit', signInManaged);
+    $('#managed-restore-retry').addEventListener('click', restoreManagedSession);
+    await restoreManagedSession();
   } else {
     readDeviceCache();
     $('#app').hidden = $('#nav').hidden = false;
@@ -3099,7 +3160,10 @@ function watchDriveImages() {
   });
   window.addEventListener('focus', refreshVisible);
   window.addEventListener('pageshow', e => { if (e.persisted) refreshVisible(); });
-  window.addEventListener('online', () => { if (hasConnection()) sync(); });
+  window.addEventListener('online', () => {
+    if (managedMode && !managedSession && !$('#managed-restore').hidden) restoreManagedSession();
+    else if (hasConnection()) sync();
+  });
   window.addEventListener('keydown', e => { if (e.key === 'Escape' && closeTopLayer()) e.preventDefault(); });
   window.__ftReady = true;
 })();

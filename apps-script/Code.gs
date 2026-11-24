@@ -79,12 +79,12 @@ function handle_(req) {
   if (req?.action === 'accessMode') {
     return { ok: true, managedAuth: managed, ownerUrl: managed ? ScriptApp.getService().getUrl() : null };
   }
-  if (!req || !['login', 'ping', 'getAll', 'batch', 'sync', 'pinResetRequest', 'pinResetVerify', 'migrationImage', 'managedImage'].includes(req.action)) {
+  if (!req || !['login', 'resume', 'logout', 'ping', 'getAll', 'batch', 'sync', 'pinResetRequest', 'pinResetVerify', 'migrationImage', 'managedImage'].includes(req.action)) {
     return { ok: false, error: 'Unknown action' };
   }
   let spreadsheetId = props.getProperty('SPREADSHEET_ID');
   if (!managed) {
-    if (req.action === 'login' || req.action === 'managedImage') return { ok: false, error: 'Managed sign-in is not available on this deployment.', code: 'setup' };
+    if (['login', 'resume', 'logout', 'managedImage'].includes(req.action)) return { ok: false, error: 'Managed sign-in is not available on this deployment.', code: 'setup' };
     const apiKey = props.getProperty('API_KEY');
     if (!apiKey || !apiKey.trim()) return { ok: false, error: 'Set API_KEY in Apps Script Project Settings.' };
     if (req.key !== apiKey) return { ok: false, error: 'Invalid API key' };
@@ -111,17 +111,31 @@ function handle_(req) {
   try {
     timed_(timings, 'lock', () => lock.waitLock(25000));
     locked = true;
-    const user = managed ? authenticateTrackerUser_(props, req.email, req.key) : null;
+    const tokenAuth = managed && (req.sessionToken !== undefined || ['resume', 'logout'].includes(req.action));
+    const session = tokenAuth ? authenticateTrackerSession_(props, req.email, req.sessionToken) : null;
+    const user = tokenAuth ? session?.user : managed ? authenticateTrackerUser_(props, req.email, req.key) : null;
     if (managed && !user) return finish({ ok: false, error: 'Email address or API key was not accepted.', code: 'auth' });
     if (user) {
       spreadsheetId = user.sheetId;
+      if (req.action === 'logout') {
+        saveTrackerSessions_(props, user, session.entries.filter(entry => entry !== session.entry));
+        return finish({ ok: true });
+      }
+      if (session && session.entry.expires - Date.now() < TRACKER_SESSION_LIFETIME - 86400000) {
+        session.entry.expires = Date.now() + TRACKER_SESSION_LIFETIME;
+        saveTrackerSessions_(props, user, session.entries);
+      }
       if (req.action === 'ping') return finish({ ok: true, pong: true });
       if (req.action === 'migrationImage') return finish({ ok: false, error: 'Legacy image export is unavailable in managed mode.' });
       if (req.action === 'managedImage') return finish(readManagedImage_(props, user, req.id));
     }
     const ss = timed_(timings, 'open', () => SpreadsheetApp.openById(spreadsheetId));
-    if (req.action === 'login') {
-      return finish({ ok: true, accountId: sha_(user.sheetId), data: timed_(timings, 'read', () => getAll_(ss)) });
+    if (req.action === 'login' || req.action === 'resume') {
+      const result = { ok: true, accountId: sha_(user.sheetId), data: timed_(timings, 'read', () => getAll_(ss)) };
+      if (req.action === 'login' && !tokenAuth && req.remember === true) {
+        result.sessionToken = issueTrackerSession_(props, user);
+      }
+      return finish(result);
     }
     if (req.action === 'pinResetRequest') return finish(pinResetRequest_(ss, user?.email));
     if (req.action === 'pinResetVerify') {
@@ -531,6 +545,43 @@ function authenticateTrackerUser_(props, email, key) {
   return mismatched ? null : user;
 }
 
+const TRACKER_SESSION_LIFETIME = 30 * 86400000;
+const TRACKER_MAX_SESSIONS = 8;
+const trackerSessionsKey_ = user => 'TRACKER_SESSIONS_' + sha_(user.email);
+
+// Session reads and writes run under the same lock as ledger writes and key rotation.
+function trackerSessions_(props, user) {
+  let saved;
+  try { saved = JSON.parse(props.getProperty(trackerSessionsKey_(user)) || 'null'); }
+  catch (err) { return []; }
+  if (saved?.nonce !== user.nonce || saved?.sheetId !== user.sheetId || !Array.isArray(saved.entries)) return [];
+  return saved.entries.filter(entry => entry.expires > Date.now());
+}
+
+function saveTrackerSessions_(props, user, entries) {
+  const key = trackerSessionsKey_(user);
+  if (!entries.length) props.deleteProperty(key);
+  else props.setProperty(key, JSON.stringify({ nonce: user.nonce, sheetId: user.sheetId, entries }));
+}
+
+function issueTrackerSession_(props, user) {
+  const token = 'fts_' + (Utilities.getUuid() + Utilities.getUuid()).replace(/-/g, '').toLowerCase();
+  const active = trackerSessions_(props, user).sort((a, b) => b.expires - a.expires);
+  const entry = { digest: sha_(token), expires: Date.now() + TRACKER_SESSION_LIFETIME };
+  saveTrackerSessions_(props, user, [entry, ...active.slice(0, TRACKER_MAX_SESSIONS - 1)]);
+  return token;
+}
+
+function authenticateTrackerSession_(props, email, token) {
+  const normalized = trackerEmail_(email);
+  if (!normalized || typeof token !== 'string' || !/^fts_[a-f0-9]{64}$/.test(token)) return null;
+  const user = trackerRegistry_(props, false).users.get(normalized);
+  if (!user?.nonce) return null;
+  const entries = trackerSessions_(props, user), digest = sha_(token);
+  const entry = entries.find(item => item.digest === digest);
+  return entry ? { user, entry, entries } : null;
+}
+
 /** Run from the Apps Script editor as the account that deploys the tracker. */
 function setupManagedTracker() {
   const props = PropertiesService.getScriptProperties();
@@ -641,6 +692,7 @@ function ownerRpc(action, email) {
       if (action === 'regenerate') {
         user.nonce = Utilities.getUuid();
         registry.sh.getRange(user.row, registry.cols.nonce + 1).setValue(user.nonce);
+        props.deleteProperty(trackerSessionsKey_(user));
       } else if (action !== 'key') return { ok: false, error: 'Unknown action.' };
     }
     SpreadsheetApp.flush();
