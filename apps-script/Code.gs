@@ -12,7 +12,7 @@ const SHEETS = {
   SubCategories: ['id', 'categoryId', 'name', 'order'],
   Records:       ['id', 'date', 'type', 'accountId', 'toAccountId', 'qty', 'item', 'categoryId', 'subCategoryId',
                   'unitAmount', 'amount', 'payee', 'note', 'image', 'plannedId', 'debtId', 'createdAt',
-                  'expiryDate', 'expiryStatus', 'remindOn'],
+                  'expiryDate', 'expiryStatus', 'remindOn', 'excludeFromReport'],
   Planned:       ['id', 'name', 'type', 'accountId', 'categoryId', 'subCategoryId', 'amount', 'payee', 'startDate',
                   'nextDue', 'repeat', 'customDays', 'autoConfirm', 'active', 'note', 'toAccountId'],
   Debts:         ['id', 'person', 'direction', 'amount', 'paid', 'date', 'dueDate', 'note', 'accountId', 'status'],
@@ -26,7 +26,7 @@ const KEYS = {
   records: 'Records', planned: 'Planned', debts: 'Debts', templates: 'Templates', receipts: 'Receipts'
 };
 const NUMS  = new Set(['initial', 'creditLimit', 'order', 'qty', 'unitAmount', 'amount', 'customDays', 'paid']);
-const BOOLS = new Set(['excluded', 'archived', 'autoConfirm', 'active']);
+const BOOLS = new Set(['excluded', 'archived', 'autoConfirm', 'active', 'excludeFromReport']);
 const DATES = new Set(['date', 'startDate', 'nextDue', 'dueDate', 'expiryDate', 'remindOn']);
 
 /** Serves the app itself. Open the /exec link and you get the Finance Tracker page. */
@@ -73,7 +73,7 @@ function handle_(req) {
   }
   function finish(result) {
     timings.total = Date.now() - started;
-    return { ...result, capabilities: { syncBatch: true }, timings };
+    return { ...result, capabilities: { syncBatch: true, reportExclusion: true }, timings };
   }
   if (req.action === 'ping') {
     try {
@@ -264,6 +264,7 @@ function readSheet_(ss, name, tz) {
       else if (NUMS.has(c)) x = Number(x) || 0;
       else if (BOOLS.has(c)) x = (x === true || String(x).toLowerCase() === 'true');
       else x = (x instanceof Date) ? x.toISOString() : String(x === null || x === undefined ? '' : x);
+      if (c === 'excludeFromReport' && !x) return;
       o[c] = x;
     });
     rows.push(o);
@@ -323,7 +324,9 @@ function runBatch_(ss, ops, timings = {}) {
         });
         const id = String(row.id);
         if (c.ids[id]) {
-          c.sh.getRange(c.ids[id], 1, 1, cols.length).setValues([values]);
+          // Older clients omit the report flag. Preserve the existing column on their edits.
+          if (op.sheet === 'Records' && typeof row.excludeFromReport !== 'boolean') values.pop();
+          c.sh.getRange(c.ids[id], 1, 1, values.length).setValues([values]);
         } else {
           c.last += 1;
           c.sh.getRange(c.last, 1, 1, cols.length).setValues([values]);

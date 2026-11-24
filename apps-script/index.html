@@ -182,6 +182,9 @@ input[readonly]{color:var(--blue);font-weight:600;background:#202426}
 .chk{display:flex;gap:12px;align-items:flex-start;padding:6px 0 14px;font-size:16px}
 .chk input{width:22px;height:22px;accent-color:var(--blue2);margin:1px 0 0;flex:none}
 .chk small{display:block;margin-top:2px}
+.report-exclusion{padding:12px;min-height:48px;border:1px solid #36363c;border-radius:12px;margin:8px 0 12px}
+.report-badge{display:inline-block;max-width:100%;margin-top:3px;padding:2px 6px;border-radius:6px;background:#233746;color:#b4d5ec;font-size:12px;white-space:normal;line-height:1.3}
+.account-sort{max-width:290px;margin-bottom:8px}
 .sugwrap,.combo{position:relative}
 .sug{display:none;position:absolute;left:0;right:0;top:calc(100% + 4px);z-index:50;background:#2e2e33;border:1px solid #484850;border-radius:12px;max-height:260px;overflow:auto;box-shadow:0 10px 30px #000a}
 .sug.on{display:block}
@@ -531,6 +534,9 @@ let ledgerStore = null, googleConfig = null, nativeDriveReady = false, legacyDec
 if (driveProfile) CFG = { url: '', key: '' };
 const cacheKey = name => driveProfile ? 'ft_drive_' + driveProfile.accountId + '_' + name : 'ft_' + name;
 const hasConnection = () => !!(ledgerStore || CFG.url);
+let reportExclusionUrl = LS.get('ft_report_exclusion_url', '');
+const canSetReportExclusion = () => !CFG.url || reportExclusionUrl === CFG.url;
+const reportExclusionUpgrade = 'Update Code.gs in Apps Script and sync to save report exclusions.';
 let DB, QUEUE, META;
 measureLocal('Startup · read device cache', () => {
   DB = Object.assign(emptyDB(), LS.get(cacheKey('db'), {}));
@@ -583,6 +589,23 @@ const subById = id => DB.subcategories.find(s => s.id === id);
 const activeAccounts = () => DB.accounts.filter(a => !a.archived).sort((a, b) => (a.order || 0) - (b.order || 0));
 const isCredit = a => a && a.type === 'credit';
 const ATYPES = { cash: { n: 'Cash', i: 'coins' }, bank: { n: 'Bank account', i: 'bank' }, savings: { n: 'Savings', i: 'savings' }, ewallet: { n: 'E-wallet', i: 'phone' }, credit: { n: 'Credit card', i: 'card' }, insurance: { n: 'Insurance / Investment', i: 'shield' }, other: { n: 'Other', i: 'wallet' } };
+const ACCOUNT_SORT = new Map([
+  ['manual', 'Current order'], ['high', 'Balance: High to Low'], ['low', 'Balance: Low to High'],
+  ['name', 'Alphabetical: A to Z'], ['type', 'Account Type']
+]);
+const accountSort = () => ACCOUNT_SORT.has(DB.settings.accountSort) ? DB.settings.accountSort : 'manual';
+const accountTypeName = a => (ATYPES[a.type] || ATYPES.other).n;
+function sortAccounts(accounts, b, mode = accountSort()) {
+  if (mode === 'manual') return accounts;
+  const byName = (a, c) => a.name.localeCompare(c.name, undefined, { sensitivity: 'base' });
+  return accounts.slice().sort((a, c) => {
+    if (mode === 'high') return b[c.id] - b[a.id] || byName(a, c);
+    if (mode === 'low') return b[a.id] - b[c.id] || byName(a, c);
+    if (mode === 'type') return accountTypeName(a).localeCompare(accountTypeName(c)) || byName(a, c);
+    return byName(a, c);
+  });
+}
+const excludedFromReport = r => r.excludeFromReport === true;
 const PALETTE = ['#5aabf5', '#46c38b', '#f2a03d', '#ef6b6b', '#a98bf0', '#f06fb0', '#35c2d1', '#c7d15a', '#8aa0b8', '#e08c5a'];
 const colorFor = id => { let h = 0; for (const c of String(id || 'x')) h = (h * 31 + c.charCodeAt(0)) >>> 0; return PALETTE[h % PALETTE.length]; };
 const catName = r => (r.categoryId && catById(r.categoryId)) ? catById(r.categoryId).name : (r.type === 'transfer' || r.type === 'adjust') ? '' : 'Uncategorized';
@@ -708,6 +731,12 @@ async function api(action, payload = {}) {
   let status = 'failed';
   try {
     if (GAS && !CFG.key) throw new ConnError('nokey', 'Enter your access key');
+    const url = CFG.url;
+    const writesReportExclusion = payload.ops?.some(op => op.sheet === 'Records' && typeof op.row?.excludeFromReport === 'boolean');
+    if (writesReportExclusion && !canSetReportExclusion()) {
+      await api('ping');
+      if (!canSetReportExclusion()) throw new Error(reportExclusionUpgrade);
+    }
     const body = measureLocal('Browser · encode ' + action, () => JSON.stringify({ key: CFG.key, action, ...payload }));
     const network = performance.now();
     let response;
@@ -728,6 +757,14 @@ async function api(action, payload = {}) {
       throw new Error(j.error || 'Server error');
     }
     if (action === 'getAll' || action === 'ping') combinedSync = j.capabilities?.syncBatch === true;
+    if (CFG.url === url) {
+      const supportedUrl = j.capabilities?.reportExclusion === true ? url : '';
+      if (reportExclusionUrl !== supportedUrl) {
+        reportExclusionUrl = supportedUrl;
+        LS.set('ft_report_exclusion_url', supportedUrl);
+      }
+    }
+    if (writesReportExclusion && j.capabilities?.reportExclusion !== true) throw new Error(reportExclusionUpgrade);
     status = j.snapshotError || j.errors?.length ? 'partial' : 'ok';
     return j;
   } finally {
@@ -1099,7 +1136,8 @@ function recRow(r) {
     cls = r.type === 'income' ? 'inc' : 'exp'; sign = r.type === 'income' ? '+' : '-';
   }
   const lead = r.image ? `<div class="dot sq" style="box-shadow:0 0 0 3px ${c1}"><img loading="lazy" src="${esc(r.image)}" data-act="imgview" data-src="${esc(r.image)}" alt=""></div>` : `<div class="dot" style="background:${bg}">${esc((title.replace(/^\d+(\.\d+)?× /, '')[0] || '?').toUpperCase())}</div>`;
-  return `<div class="item coded" style="--ac:${c1};cursor:pointer" data-act="recopen" data-id="${esc(r.id)}">${lead}<div class="mid"><b>${esc(title)}</b><small>${subH}</small></div><div class="amt ${cls}">${sign}${fmt(amt)}</div></div>`;
+  const badge = excludedFromReport(r) ? '<span class="report-badge">Excluded from report</span>' : '';
+  return `<div class="item coded" style="--ac:${c1};cursor:pointer" data-act="recopen" data-id="${esc(r.id)}">${lead}<div class="mid"><b>${esc(title)}</b><small>${subH}</small>${badge}</div><div class="amt ${cls}">${sign}${fmt(amt)}</div></div>`;
 }
 const sortRecs = a => a.sort((x, y) => y.date.localeCompare(x.date) || String(y.createdAt).localeCompare(String(x.createdAt)));
 const typeIcon = t => (ATYPES[t] || ATYPES.other).i;
@@ -1149,7 +1187,7 @@ function expSnooze(id) {
 const EXP_LABEL = { consumed: 'Consumed', disposed: 'Disposed', using: 'Still using' };
 
 function vHome() {
-  const accs = activeAccounts(), b = balances(), T = totals();
+  const b = balances(), accs = sortAccounts(activeAccounts(), b), T = totals();
   let sel = UI.selAcc && accById(UI.selAcc); if (!sel || sel.archived) { sel = null; UI.selAcc = null; }
   const chips = accs.map(a => {
     const cr = isCredit(a), owed = -b[a.id];
@@ -1165,6 +1203,7 @@ function vHome() {
   const banner = (!hasConnection() && !UI.bannerOff) ? `<div class="banner"><b>Preview mode</b><br>Your data is only stored on this device. Connect your Google Sheet in Settings → Data & Sync to start saving to it.<div class="row"><button class="btn sm" data-act="go" data-v="settings">Open settings</button>${DB.records.length ? '' : `<button class="btn sm" data-act="sample">Load sample data</button>`}<button class="btn sm ghost" data-act="bannerOff">Dismiss</button></div></div>` : '';
   return `${expBanner()}${banner}
   <div class="sec"><h2>My Accounts in Wallet</h2><button class="pillbtn" style="padding:8px 12px;border-radius:12px" data-act="go" data-v="settings" title="Manage accounts">${ic('right', 20)}</button></div>
+  <div class="pad">${accountSortField()}</div>
   <div class="grid">${chips}<button class="achip add" data-act="addacc">Add account ${ic('plus', 26)}</button></div>
   <div class="sumcard"><div class="sumtop">${selTop}</div>
    <div class="sumgrid"><div><span class="lbl">All non-excluded</span><b>${fmt(T.all)}</b></div><div><span class="lbl">Total owed</span><b class="${T.owed > 0 ? 'neg' : ''}">${fmt(T.owed)}</b></div><div><span class="lbl">Net after owed</span><b class="${T.net < 0 ? 'neg' : ''}">${fmt(T.net)}</b></div></div></div>
@@ -1320,8 +1359,9 @@ ACT.rcmore = () => { UI.rcp.limit += 60; $('#rcplist').innerHTML = rcpList(); };
 ACT.rcopen = t => receiptDetail(t.dataset.id);
 
 function vSettings() {
-  const accs = activeAccounts(), b = balances(), tab = UI.catTab;
-  const accRows = accs.map(a => `<div class="arow drow" data-id="${esc(a.id)}"><div class="handle" title="Drag to reorder">${ic('handle', 26)}</div>
+  const b = balances(), mode = accountSort(), accs = sortAccounts(activeAccounts(), b, mode), tab = UI.catTab;
+  const handle = mode === 'manual' ? `<div class="handle" title="Drag to reorder">${ic('handle', 26)}</div>` : '';
+  const accRows = accs.map(a => `<div class="arow drow" data-id="${esc(a.id)}">${handle}
     <span style="color:${accColor(a.id)}">${ic(typeIcon(a.type), 22)}</span><div class="mid" style="flex:1;min-width:0"><b style="display:block;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(a.name)}${a.excluded ? '<span class="tag or">excluded</span>' : ''}</b><small>${ATYPES[a.type] ? ATYPES[a.type].n : ''} · ${isCredit(a) ? fmt(-b[a.id]) + ' owed / ' + fmt0(a.creditLimit) : fmt(b[a.id])}</small></div>
     <button class="hbtn" data-act="editacc" data-id="${esc(a.id)}">${ic('edit', 22)}</button></div>`).join('');
   const cats = userCats(tab).map(c => {
@@ -1334,7 +1374,7 @@ function vSettings() {
   return `
   ${installablePage && !appInstalled && !standalone.matches && !navigator.standalone ? `<div class="card"><button class="btn pri full" data-act="installapp">${ic('download', 20)}Install app</button></div>` : ''}
   <div class="sec"><h2>Accounts</h2><button class="btn sm pri" data-act="addacc">${ic('plus', 18)}Add account</button></div>
-  <div class="card" style="margin-top:0"><small>Drag the handle to arrange accounts. This is the order used on the home screen. Tap the pencil to rename, change the balance or credit limit.</small><div id="acclist" data-kind="acc" style="margin-top:6px">${accRows || '<div class="empty">No accounts.</div>'}</div></div>
+  <div class="card" style="margin-top:0">${accountSortField()}<small>${mode === 'manual' ? 'Drag the handle to arrange accounts. ' : ''}Tap the pencil to edit an account.</small><div id="acclist" data-kind="acc" style="margin-top:6px">${accRows || '<div class="empty">No accounts.</div>'}</div></div>
 
   <div class="sec"><h2>Categories</h2><div class="row" style="flex:none"><button class="btn sm pri" data-act="newcat">${ic('plus', 18)}Category</button><button class="btn sm" data-act="newsub">${ic('plus', 18)}Sub</button></div></div>
   <div class="pad"><div class="seg"><button class="${tab === 'expense' ? 'on' : ''}" data-act="cattab" data-t="expense">Expense</button><button class="${tab === 'income' ? 'on' : ''}" data-act="cattab" data-t="income">Income sources</button></div></div>
@@ -1371,6 +1411,12 @@ ACT.catsort = () => { userCats(UI.catTab).sort((a, b) => a.name.localeCompare(b.
 ACT.cattab = t => { UI.catTab = t.dataset.t; render(); };
 CHG.autohide = t => { AUTOHIDE = Number(t.value) || 0; LS.set('ft_autohide', AUTOHIDE); toast(AUTOHIDE ? `Amounts will hide after ${AUTOHIDE} min away` : 'Auto-hide is off'); };
 CHG.cur = t => { setSetting('currency', t.value.trim() || '₱'); render(); };
+CHG.accountsort = t => {
+  if (!ACCOUNT_SORT.has(t.value) || t.value === accountSort()) return;
+  setSetting('accountSort', t.value);
+  render();
+  $('#view [data-chg="accountsort"]')?.focus({ preventScroll: true });
+};
 ACT.saveconn = async () => {
   if (syncing || connecting) return toast('Wait for the current connection to finish.');
   if (GAS) {
@@ -1456,6 +1502,14 @@ const catOpts = (type, sel, allowNew) => `<option value="">Select category</opti
 const subsOf = catId => DB.subcategories.filter(s => s.categoryId === catId).sort((a, b) => (a.order || 0) - (b.order || 0) || a.name.localeCompare(b.name));
 const subOpts = (catId, sel, allowNew) => `<option value="">None</option>` + subsOf(catId).map(s => `<option value="${esc(s.id)}" ${s.id === sel ? 'selected' : ''}>${esc(s.name)}</option>`).join('') + (allowNew && catId ? `<option value="__new">＋ New sub category…</option>` : '');
 const fld = (label, inner, req) => `<label class="fld"><span>${label}${req ? ' <i>*</i>' : ''}</span>${inner}</label>`;
+function accountSortField() {
+  const mode = accountSort();
+  return `<div class="account-sort">${fld('Sort by', `<select data-chg="accountsort">${Array.from(ACCOUNT_SORT, ([value, label]) => `<option value="${value}"${value === mode ? ' selected' : ''}>${label}</option>`).join('')}</select>`)}</div>`;
+}
+function reportExclusionField(r) {
+  const supported = canSetReportExclusion();
+  return `<label class="chk report-exclusion"><input type="checkbox" id="f-report-exclusion"${excludedFromReport(r) ? ' checked' : ''}${supported ? '' : ' disabled'}><span>Exclude from Financial Report<small>${supported ? 'The entry stays in Records and still affects your account balance.' : reportExclusionUpgrade}</small></span></label>`;
+}
 const ensureDebtCat = () => { if (!catById('cat_debt')) up('Categories', { id: 'cat_debt', name: 'Debt & Loans', type: 'system', order: 99 }); };
 
 let _ix = null, _ixVer = -1;
@@ -1508,6 +1562,7 @@ function openRecord(o = {}) {
   if (ex && ex.type === 'adjust') return accountSheet(ex.accountId);
   if (!activeAccounts().length) { toast('Add an account first'); return accountSheet(); }
   F = ex ? { ...ex, unit: ex.unitAmount || '', qty: ex.qty || 1, edit: true, expiryDate: ex.expiryDate || '', origExpiry: ex.expiryDate || '' } : { type: o.type || 'expense', accountId: o.accountId || defaultAccount(), toAccountId: '', qty: 1, item: '', categoryId: '', subCategoryId: '', unit: '', amount: '', payee: '', date: today(), note: '', image: '', expiryDate: '', origExpiry: '' };
+  F.initialReportExclusion = excludedFromReport(F);
   if (F.type === 'transfer' && !F.toAccountId) F.toAccountId = (activeAccounts().find(a => a.id !== F.accountId) || {}).id || '';
   FL = openLayer(`<div class="rec"><div class="rec-top"><button class="hbtn" data-act="lclose">${ic('close', 28)}</button><span id="rtitle"></span><button class="hbtn" data-act="rsave">${ic('check', 30)}</button></div>
     <div class="rtabs" id="rtabs"></div><div class="rec-amt"><span class="sign" id="rsign"></span><span class="num" id="rnum">0</span><span class="cur">${CUR === '₱' ? 'PHP' : esc(CUR)}</span></div><button class="tplbar" id="tplbar" data-act="tplopen">TEMPLATES</button><div class="rec-body" id="rbody"></div></div>`, 'full t-' + F.type);
@@ -1543,6 +1598,7 @@ function renderForm() {
       + `<div class="mut" style="font-size:13.5px;margin:-4px 0 14px">Tip: transferring to a credit card pays down what you owe. Transferring from one card to another moves the balance.</div>`
       + fld('Date', `<input type="date" id="f-date" value="${esc(F.date)}">`) + fld('Note', `<input type="text" id="f-note" data-sug="note" value="${esc(F.note)}" placeholder="Optional" autocomplete="off">`);
   }
+  h += reportExclusionField(F);
   if (!F.edit) h += `<button type="button" class="btn full" data-act="tplsave" style="margin-top:4px">${ic('plus', 18)}Save as template</button>`;
   $('#tplbar', FL).style.display = F.edit ? 'none' : 'block';
   $('#rbody', FL).innerHTML = h; bindForm(); updTotal();
@@ -1561,6 +1617,8 @@ function bindForm() {
   const bi = (id, key, after) => { const e = g(id); if (e) e.addEventListener('input', () => { F[key] = e.value; if (after) after(); }); };
   bi('f-acc', 'accountId'); bi('f-to', 'toAccountId'); bi('f-item', 'item'); bi('f-qty', 'qty', updTotal); bi('f-unit', 'unit', updTotal);
   bi('f-amount', 'amount', updTotal); bi('f-payee', 'payee'); bi('f-date', 'date'); bi('f-note', 'note'); bi('f-exp', 'expiryDate');
+  const reportFlag = g('f-report-exclusion');
+  reportFlag.addEventListener('change', () => { F.excludeFromReport = reportFlag.checked; });
   [['f-acc'], ['f-to']].forEach(([id]) => { const e = g(id); if (e) { const tint = () => { e.style.borderLeft = '6px solid ' + accColor(e.value); }; tint(); e.addEventListener('change', tint); } });
   const c = g('f-cat'), s = g('f-sub');
   if (c) c.addEventListener('change', () => {
@@ -1612,6 +1670,11 @@ ACT.rsave = () => {
     if (!(num(F.amount) > 0)) return bad('Enter the amount');
     Object.assign(rec, { item: 'Transfer', toAccountId: F.toAccountId, unitAmount: num(F.amount), amount: num(F.amount), payee: '' });
   }
+  const current = F.edit && DB.records.find(r => r.id === F.id);
+  if (excludedFromReport(F) !== F.initialReportExclusion) {
+    if (!canSetReportExclusion()) return bad(reportExclusionUpgrade);
+    rec.excludeFromReport = excludedFromReport(F);
+  } else if (current && excludedFromReport(current)) rec.excludeFromReport = true;
   up('Records', rec); closeLayer(FL); toast(F.edit ? 'Record updated' : 'Saved'); render();
 };
 
@@ -1623,6 +1686,7 @@ function recDetail(id) {
   const s = subById(r.subCategoryId);
   const tcol = r.type === 'expense' ? 'var(--red)' : r.type === 'income' ? 'var(--green)' : r.type === 'transfer' ? 'var(--blue)' : 'inherit';
   add('Type', `<span style="color:${tcol}">${r.type === 'adjust' ? 'Balance adjustment' : r.type[0].toUpperCase() + r.type.slice(1)}</span>`);
+  if (r.type !== 'adjust' && excludedFromReport(r)) add('Financial Report', 'Excluded');
   add('Date', fmtD(r.date));
   if (r.type === 'expense' && r.expiryDate) add('Expiry date', fmtD(r.expiryDate) + (r.expiryStatus ? ` · ${EXP_LABEL[r.expiryStatus] || ''}${r.expiryStatus === 'using' && r.remindOn ? ', reminder ' + fmtDS(r.remindOn) : ''}` : ''));
   add(r.type === 'transfer' ? 'From' : 'Account', accTag(r.accountId)); if (r.type === 'transfer') add('To', accTag(r.toAccountId));
@@ -1630,9 +1694,18 @@ function recDetail(id) {
   add(r.type === 'income' ? 'Source' : 'Category', esc(catName(r)) + (s ? ' › ' + esc(s.name) : ''));
   add(r.type === 'income' ? 'From' : 'Payee', esc(r.payee)); add('Note', esc(r.note));
   const body = `${r.image ? `<img src="${esc(r.image)}" data-act="imgview" data-src="${esc(r.image)}" style="width:100%;max-height:300px;object-fit:cover;border-radius:14px;margin-bottom:12px" alt="">` : ''}
-   <div style="text-align:center;margin:4px 0 8px"><b style="font-size:20px;font-weight:500">${esc(r.type === 'transfer' ? 'Transfer' : r.type === 'adjust' ? 'Balance adjustment' : r.item)}</b><br><b style="font-size:30px;color:${tcol === 'inherit' ? '#fff' : tcol}">${fmt(num(r.amount))}</b></div>${rows.join('')}`;
+   <div style="text-align:center;margin:4px 0 8px"><b style="font-size:20px;font-weight:500">${esc(r.type === 'transfer' ? 'Transfer' : r.type === 'adjust' ? 'Balance adjustment' : r.item)}</b><br><b style="font-size:30px;color:${tcol === 'inherit' ? '#fff' : tcol}">${fmt(num(r.amount))}</b></div>${rows.join('')}${r.type === 'adjust' ? reportExclusionField(r) : ''}`;
   const rc = DB.receipts.find(x => x.recordId === r.id);
-  const d = sheet('Record', body, `<button class="btn danger" id="rd-del" style="flex:none" title="Delete">${ic('del', 18)}</button>${r.type === 'adjust' ? '' : `<button class="btn" id="rd-rc">${ic('receipt', 18)}${rc ? 'View receipt' : 'Add receipt'}</button><button class="btn pri" id="rd-edit">${ic('edit', 18)}Edit</button>`}`);
+  const d = sheet('Record', body, `<button class="btn danger" id="rd-del" style="flex:none" title="Delete">${ic('del', 18)}</button>${r.type === 'adjust' ? `<button class="btn pri" id="rd-save-report"${canSetReportExclusion() ? '' : ' disabled'}>Save</button>` : `<button class="btn" id="rd-rc">${ic('receipt', 18)}${rc ? 'View receipt' : 'Add receipt'}</button><button class="btn pri" id="rd-edit">${ic('edit', 18)}Edit</button>`}`);
+  const saveReport = $('#rd-save-report', d);
+  if (saveReport) saveReport.onclick = () => {
+    const current = DB.records.find(record => record.id === id);
+    if (!current) { closeLayer(d); return toast('This record is no longer available.'); }
+    if (!canSetReportExclusion()) return toast(reportExclusionUpgrade);
+    const excludeFromReport = $('#f-report-exclusion', d).checked;
+    if (excludeFromReport !== excludedFromReport(current)) up('Records', { ...current, excludeFromReport });
+    closeLayer(d); render();
+  };
   const rb = $('#rd-rc', d); if (rb) rb.onclick = () => { closeLayer(d); if (rc) receiptDetail(rc.id); else receiptSheet(null, { title: r.payee || r.item || catName(r), date: r.date, amount: r.amount, note: r.type === 'expense' ? r.item : '', recordId: r.id }); };
   $('#rd-del', d).onclick = () => { closeLayer(d); confirmDlg('Delete this record? Account balances will update.', 'Delete', () => { del('Records', r.id); render(); toast('Deleted'); }); };
   const e = $('#rd-edit', d); if (e) e.onclick = () => { closeLayer(d); openRecord({ id: r.id }); };
@@ -1647,9 +1720,13 @@ function accountSheet(id) {
     + `<div class="fld"><span>Colour (used to colour-code its records)</span><div class="swatches" id="a-colors">${ACOLORS.map(c => `<button type="button" class="sw2 ${c === selColor ? 'on' : ''}" data-color="${c}" style="background:${c}" aria-label="${c}"></button>`).join('')}</div></div>`
     + `<div id="a-cr" style="display:${cr ? 'block' : 'none'}">${fld('Credit limit', `<input type="number" id="a-limit" inputmode="decimal" step="any" min="0" value="${a ? a.creditLimit : ''}" placeholder="0.00">`, 1)}</div>`
     + fld(`<span id="a-ilbl">${acctInitLabel(type, !!a)}</span>`, `<input type="number" id="a-init" inputmode="decimal" step="any" value="${a ? r2(cur) : ''}" placeholder="0.00">`)
-    + (a ? `<div class="mut" style="font-size:13px;margin:-8px 0 12px">Changing this value creates a “Balance adjustment” record so your history stays intact.</div>` : '')
+    + (a ? `<div class="mut" style="font-size:13px;margin:-8px 0 12px">Changing this value creates a “Balance adjustment” record so your history stays intact.</div><div id="a-report-option" hidden>${reportExclusionField({})}</div>` : '')
     + `<label class="chk"><input type="checkbox" id="a-exc" ${a && a.excluded ? 'checked' : ''}><div>Exclude from totals<small>Hidden from “All non-excluded” and “Total owed”.</small></div></label>`;
   const d = sheet(a ? 'Edit account' : 'New account', body, `${a ? `<button class="btn danger" id="a-del" style="flex:none">${ic('del', 18)}</button>` : ''}<button class="btn" data-act="lclose">Cancel</button><button class="btn pri" id="a-save">Save</button>`);
+  if (a) {
+    const amount = $('#a-init', d), option = $('#a-report-option', d);
+    amount.addEventListener('input', () => { option.hidden = amount.value === '' || r2(num(amount.value)) === r2(cur); });
+  }
   $('#a-colors', d).onclick = e => { const b = e.target.closest('[data-color]'); if (!b) return; selColor = b.dataset.color; $$('.sw2', d).forEach(x => x.classList.toggle('on', x === b)); };
   if (a) $('#a-del', d).onclick = () => {
     const used = DB.records.some(r => r.accountId === a.id || r.toAccountId === a.id);
@@ -1663,9 +1740,15 @@ function accountSheet(id) {
     if (!a) {
       up('Accounts', { id: uid(), name, type: t, initial: v, creditLimit: c ? limit : 0, excluded: exc, order: Math.max(-1, ...DB.accounts.map(x => x.order || 0)) + 1, archived: false, createdAt: new Date().toISOString(), color: selColor });
     } else {
-      up('Accounts', { ...a, name, creditLimit: c ? limit : 0, excluded: exc, color: selColor });
       const delta = r2(v - r2(cur));
-      if (delta !== 0) up('Records', { id: uid(), date: today(), type: 'adjust', accountId: a.id, toAccountId: '', qty: 1, item: 'Balance adjustment', categoryId: '', subCategoryId: '', unitAmount: 0, amount: c ? -delta : delta, payee: '', note: `Set from ${fmtRaw(r2(cur))} to ${fmtRaw(v)}`, image: '', plannedId: '', debtId: '', createdAt: new Date().toISOString() });
+      const excludeFromReport = delta !== 0 && $('#f-report-exclusion', d).checked;
+      if (excludeFromReport && !canSetReportExclusion()) return toast(reportExclusionUpgrade);
+      up('Accounts', { ...a, name, creditLimit: c ? limit : 0, excluded: exc, color: selColor });
+      if (delta !== 0) {
+        const record = { id: uid(), date: today(), type: 'adjust', accountId: a.id, toAccountId: '', qty: 1, item: 'Balance adjustment', categoryId: '', subCategoryId: '', unitAmount: 0, amount: c ? -delta : delta, payee: '', note: `Set from ${fmtRaw(r2(cur))} to ${fmtRaw(v)}`, image: '', plannedId: '', debtId: '', createdAt: new Date().toISOString() };
+        if (excludeFromReport) record.excludeFromReport = true;
+        up('Records', record);
+      }
     }
     closeLayer(d); render(); toast(a ? 'Account updated' : 'Account added');
   };
@@ -2044,7 +2127,8 @@ ACT.sample = () => {
   ensureColors(); UI.bannerOff = true; processPlanned(); render(); toast('Sample data loaded');
 };
 
-const statRecs = (rg, kind) => DB.records.filter(r => (r.type === 'expense' || r.type === 'income') && !r.debtId && inRange(r.date, rg) && (!kind || r.type === kind));
+const statRecs = (rg, kind) => DB.records.filter(r => (r.type === 'expense' || r.type === 'income') &&
+  !r.debtId && !excludedFromReport(r) && inRange(r.date, rg) && (!kind || r.type === kind));
 const sumAmt = a => a.reduce((s, r) => s + num(r.amount), 0);
 const empty = m => `<div class="empty">${m}</div>`;
 const kpi = (l, v, cls = '') => `<div class="kpi"><span class="lbl">${l}</span><b class="${cls}">${v}</b></div>`;
@@ -2181,7 +2265,7 @@ function sCredit() {
 
 function sReports() {
   const rg = periodRange(UI.periods.stats), recs = statRecs(rg), inc = sumAmt(recs.filter(r => r.type === 'income')), ex = recs.filter(r => r.type === 'expense'), exp = sumAmt(ex);
-  if (!recs.length) return empty('No records in this period.');
+  if (!recs.length) return empty('No reportable records in this period.');
   const ds = recs.map(r => r.date).sort(), from = rg.from || ds[0], to = (rg.to && rg.to < today()) ? rg.to : (rg.to ? today() : today()), days = Math.max(1, daysBetween(from, to < from ? from : to) + 1);
   const big = ex.slice().sort((a, b) => num(b.amount) - num(a.amount))[0];
   return `<div class="kpis">${kpi('Income', fmt(inc), 'pos')}${kpi('Expenses', fmt(exp), 'neg')}${kpi('Net', fmt(inc - exp), inc - exp >= 0 ? 'pos' : 'neg')}${kpi('Avg / day spent', fmt(exp / days), 'neg')}${kpi('Transactions', recs.length)}${kpi('Largest expense', big ? fmt(big.amount) : '–', 'neg')}</div>
@@ -2194,21 +2278,28 @@ function sReports() {
 }
 ACT.csv = () => {
   const rg = periodRange(UI.periods.stats), rows = [['Date', 'Type', 'Account', 'To account', 'Item', 'Quantity', 'Amount per piece', 'Total', 'Category', 'Sub category', 'Payee', 'Note', 'Expiry date', 'Expiry status']];
-  sortRecs(DB.records.filter(r => inRange(r.date, rg))).forEach(r => rows.push([r.date, r.type, accN(r.accountId), r.toAccountId ? accN(r.toAccountId) : '', r.item, r.qty, r.unitAmount, r.amount, catName(r), (subById(r.subCategoryId) || {}).name || '', r.payee, r.note, r.expiryDate || '', EXP_LABEL[r.expiryStatus] || '']));
+  sortRecs(DB.records.filter(r => !excludedFromReport(r) && inRange(r.date, rg))).forEach(r => rows.push([r.date, r.type, accN(r.accountId), r.toAccountId ? accN(r.toAccountId) : '', r.item, r.qty, r.unitAmount, r.amount, catName(r), (subById(r.subCategoryId) || {}).name || '', r.payee, r.note, r.expiryDate || '', EXP_LABEL[r.expiryStatus] || '']));
   const csv = rows.map(r => r.map(v => `"${String(v ?? '').replace(/"/g, '""')}"`).join(',')).join('\n');
   const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob(['\uFEFF' + csv], { type: 'text/csv' })); a.download = `records-${today()}.csv`; a.click();
 };
 
 function sAssets() {
-  const b = balances(), accs = activeAccounts().filter(a => !a.excluded), assets = accs.filter(a => !isCredit(a)), groups = {};
-  assets.forEach(a => { (groups[a.type] = groups[a.type] || []).push(a); });
-  const sums = Object.entries(groups).map(([t, l]) => [t, l.reduce((s, a) => s + b[a.id], 0), l]).sort((x, y) => y[1] - x[1]), aTot = sums.reduce((s, x) => s + x[1], 0);
+  const b = balances(), accs = activeAccounts().filter(a => !a.excluded);
+  const assets = sortAccounts(accs.filter(a => !isCredit(a)), b);
+  const groups = new Map();
+  assets.forEach(a => {
+    const type = accountTypeName(a);
+    groups.set(type, (groups.get(type) || 0) + b[a.id]);
+  });
+  const sums = Array.from(groups).sort((x, y) => y[1] - x[1] || x[0].localeCompare(y[0]));
+  const aTot = sums.reduce((s, x) => s + x[1], 0);
   const cardOwed = accs.filter(isCredit).reduce((s, a) => s + Math.max(0, -b[a.id]), 0);
   const rem = d => Math.max(0, num(d.amount) - num(d.paid)), dOwe = DB.debts.filter(d => d.direction === 'owe' && d.status !== 'settled').reduce((s, d) => s + rem(d), 0), dLent = DB.debts.filter(d => d.direction === 'lent' && d.status !== 'settled').reduce((s, d) => s + rem(d), 0);
   const liab = cardOwed + dOwe, net = aTot + dLent - liab, pos = sums.filter(x => x[1] > 0), pt = pos.reduce((s, x) => s + x[1], 0);
   return `<div class="kpis">${kpi('Net worth', fmt(net), net < 0 ? 'neg' : 'pos')}${kpi('Assets', fmt(aTot))}${kpi('Money lent', fmt(dLent))}${kpi('Liabilities', fmt(liab), liab ? 'neg' : '')}</div>
   <div class="card"><h3>Where your money is</h3>${pt ? `<div style="display:flex;height:16px;border-radius:8px;overflow:hidden;margin:6px 0 14px">${pos.map((x, i) => `<i style="width:${x[1] / pt * 100}%;background:${PALETTE[i % 10]}"></i>`).join('')}</div>` : ''}
-   ${sums.map(([t, v, l], i) => `<div style="padding:6px 0"><div class="row"><span><span class="sw" style="display:inline-block;background:${PALETTE[i % 10]};margin-right:8px;vertical-align:-1px"></span><b>${ATYPES[t].n}</b></span><b style="flex:none;text-align:right">${fmt(v)}</b></div>${l.map(a => `<div class="subrow"><span>${esc(a.name)}</span><span>${fmt(b[a.id])}</span></div>`).join('')}</div>`).join('') || '<small>No accounts.</small>'}</div>
+   ${sums.map(([type, total], i) => `<div class="row" style="padding:6px 0"><span><span class="sw" style="display:inline-block;background:${PALETTE[i % 10]};margin-right:8px;vertical-align:-1px"></span><b>${esc(type)}</b></span><b style="flex:none;text-align:right">${fmt(total)}</b></div>`).join('') || '<small>No accounts.</small>'}</div>
+  <div class="card"><h3>Asset accounts</h3>${accountSortField()}${assets.map(a => `<div class="item" style="padding-inline:0"><div class="mid"><b>${esc(a.name)}</b><small>${esc(accountTypeName(a))}</small></div><div class="amt">${fmt(b[a.id])}</div></div>`).join('') || '<small>No accounts.</small>'}</div>
   <div class="card"><h3>Liabilities</h3><div class="subrow" style="padding-left:0"><span>Credit cards</span><span class="neg">${fmt(cardOwed)}</span></div><div class="subrow" style="padding-left:0"><span>Debts I owe</span><span class="neg">${fmt(dOwe)}</span></div><div class="subrow" style="padding-left:0"><span>Owed to me</span><span class="pos">${fmt(dLent)}</span></div></div>
   <div class="pad mut" style="font-size:13px">Accounts marked “excluded from totals” are left out.</div>`;
 }
