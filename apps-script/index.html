@@ -315,6 +315,13 @@ hr.sp{border:0;border-top:1px solid #2a2a2e;margin:8px 0}
 #drive-login h1{margin:12px 0 8px;font-size:28px}
 #drive-login .card{margin:18px 0;text-align:left;overflow-wrap:anywhere}
 #drive-login .btn{min-height:48px}
+#managed-login[hidden]{display:none}
+#managed-login{min-height:100dvh;display:grid;grid-template-rows:1fr auto;align-items:center;padding:24px max(20px,env(safe-area-inset-right)) max(16px,env(safe-area-inset-bottom))}
+.managed-signin{width:min(100%,360px);margin:auto}
+.managed-signin h1{margin:2px 0 22px;font-size:26px}
+.managed-signin .btn{min-height:48px}
+.managed-owner{align-self:end;justify-self:end;display:flex;align-items:center;min-height:44px;font-size:14px;color:var(--mut);text-underline-offset:3px}
+#managed-error{margin:12px 0 0}
 
 /* checkbox multi-select filters */
 .ms{position:relative;min-width:0}
@@ -394,14 +401,27 @@ hr.sp{border:0;border-top:1px solid #2a2a2e;margin:8px 0}
 </head>
 <body>
 <main id="drive-login" hidden></main>
-<div id="app">
+<main id="managed-login" hidden>
+  <div class="managed-signin">
+    <small>Personal Finance Tracker</small>
+    <h1>Sign in</h1>
+    <form id="managed-form">
+      <label class="fld"><span>Email Address</span><input id="managed-email" type="email" autocomplete="username" maxlength="254" required></label>
+      <label class="fld"><span>API Key</span><input id="managed-key" type="password" autocomplete="current-password" maxlength="128" required></label>
+      <button class="btn pri full" type="submit">Sign In</button>
+    </form>
+    <p id="managed-error" class="neg" role="status" hidden></p>
+  </div>
+  <a class="managed-owner" id="managed-owner" target="_blank" rel="noopener noreferrer">Login as system owner</a>
+</main>
+<div id="app" hidden>
   <header class="hdr" id="hdr"></header>
   <main id="view"></main>
   <button class="fab" id="fab" data-act="add" aria-label="Add record">
     <svg width="34" height="34" viewBox="0 0 24 24" fill="currentColor"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>
   </button>
 </div>
-<nav id="nav"></nav>
+<nav id="nav" hidden></nav>
 <div id="layers"></div>
 <div id="toast"></div>
 <div id="busy" role="alert" aria-live="polite"><div class="spinner"></div><p id="busy-msg">Loading…</p><button class="btn sm" id="busy-skip" style="display:none">Continue without waiting</button></div>
@@ -526,31 +546,38 @@ function awayCheck() {
 const TABLES = { Accounts: 'accounts', Categories: 'categories', SubCategories: 'subcategories', Records: 'records', Planned: 'planned', Debts: 'debts', Templates: 'templates', Receipts: 'receipts' };
 const emptyDB = () => ({ accounts: [], categories: [], subcategories: [], records: [], planned: [], debts: [], templates: [], receipts: [], settings: {} });
 const GAS = !!(window.google && google.script && google.script.run);
+const managedEndpoint = 'https://script.google.com/macros/s/AKfycbxNBrkv3MuNP_pcBk8r_K6uzaiujoA7zxxxuPBg8pHkKaaBTVWhuLqJy5eCj0l8hYub/exec';
+const managedWebDefault = false;
+let managedMode = false, managedUrl = managedEndpoint, managedSession = null;
+const unsavedManagedQueues = new Map();
 let CFG = LS.get('ft_cfg', { url: '', key: '' });
 if (GAS) CFG.url = 'gas';
 const saveCfg = () => LS.set('ft_cfg', { url: GAS ? '' : CFG.url, key: CFG.key });
 let driveProfile = GAS ? null : LS.get('ft_drive_profile', null);
 let ledgerStore = null, googleConfig = null, nativeDriveReady = false, legacyDecisionPending = false;
 if (driveProfile) CFG = { url: '', key: '' };
-const cacheKey = name => driveProfile ? 'ft_drive_' + driveProfile.accountId + '_' + name : 'ft_' + name;
-const hasConnection = () => !!(ledgerStore || CFG.url);
+const cacheKey = name => managedSession ? 'ft_managed_' + managedSession.accountId + '_' + name
+  : driveProfile ? 'ft_drive_' + driveProfile.accountId + '_' + name : 'ft_' + name;
+const hasConnection = () => !!(managedSession || ledgerStore || CFG.url);
 let reportExclusionUrl = LS.get('ft_report_exclusion_url', '');
 const canSetReportExclusion = () => !CFG.url || reportExclusionUrl === CFG.url;
 const reportExclusionUpgrade = 'Update Code.gs in Apps Script and sync to save report exclusions.';
-let DB, QUEUE, META;
-measureLocal('Startup · read device cache', () => {
-  DB = Object.assign(emptyDB(), LS.get(cacheKey('db'), {}));
-  QUEUE = LS.get(cacheKey('queue'), []);
-  META = LS.get(cacheKey('meta'), { last: 0 });
-  QUEUE.forEach(op => applyOp(DB, op));
-});
+let DB = emptyDB(), QUEUE = [], META = { last: 0 };
+function readDeviceCache() {
+  measureLocal('Startup · read device cache', () => {
+    DB = Object.assign(emptyDB(), LS.get(cacheKey('db'), {}));
+    QUEUE = LS.get(cacheKey('queue'), []);
+    META = LS.get(cacheKey('meta'), { last: 0 });
+    QUEUE.forEach(op => applyOp(DB, op));
+  });
+}
 let ver = 0;
 
 let persistT = null, dbDirty = false, queueDirty = false;
 function persistSoon() { dbDirty = true; clearTimeout(persistT); persistT = setTimeout(persistNow, 60); }
 function persistNow() {
   clearTimeout(persistT);
-  if (dbDirty) dbDirty = !measureLocal('Device · save records cache', () => LS.set(cacheKey('db'), DB));
+  if (dbDirty) dbDirty = !managedMode && !measureLocal('Device · save records cache', () => LS.set(cacheKey('db'), DB));
   if (queueDirty) queueDirty = !measureLocal('Device · save pending changes', () => LS.set(cacheKey('queue'), QUEUE));
   if ((dbDirty || queueDirty) && !persistNow.warned) { persistNow.warned = true; setTimeout(() => toast('This device is out of storage space. Connect your Google Sheet so pictures are saved there.'), 300); }
 }
@@ -726,22 +753,24 @@ function gasCall(body) {
       .rpc(body);
   });
 }
-async function api(action, payload = {}) {
+async function api(action, payload = {}, auth = managedSession) {
   const started = performance.now();
   let status = 'failed';
   try {
-    if (GAS && !CFG.key) throw new ConnError('nokey', 'Enter your access key');
-    const url = CFG.url;
+    if (GAS && !auth && !CFG.key) throw new ConnError('nokey', 'Enter your access key');
+    const url = auth ? managedUrl : CFG.url;
     const writesReportExclusion = payload.ops?.some(op => op.sheet === 'Records' && typeof op.row?.excludeFromReport === 'boolean');
-    if (writesReportExclusion && !canSetReportExclusion()) {
+    if (!auth && writesReportExclusion && !canSetReportExclusion()) {
       await api('ping');
       if (!canSetReportExclusion()) throw new Error(reportExclusionUpgrade);
     }
-    const body = measureLocal('Browser · encode ' + action, () => JSON.stringify({ key: CFG.key, action, ...payload }));
+    const body = measureLocal('Browser · encode ' + action, () => JSON.stringify({
+      ...payload, action, key: auth ? auth.key : CFG.key, ...(auth ? { email: auth.email } : {})
+    }));
     const network = performance.now();
     let response;
     try {
-      response = await (GAS ? gasCall(body) : fetchScript(body));
+      response = await (GAS ? gasCall(body) : fetchScript(body, url));
     } finally {
       logPerformance('Browser · wait for ' + action, performance.now() - network, response === undefined ? 'failed' : 'ok', response?.length);
     }
@@ -753,11 +782,12 @@ async function api(action, payload = {}) {
       if (Number.isFinite(ms) && ms >= 0) logPerformance(label + ' (' + action + ')', ms, 'measured');
     });
     if (!j.ok) {
+      if (auth && j.code === 'auth') throw new ConnError('managedauth', j.error);
       if (GAS && j.error === 'Invalid API key') throw new ConnError('badkey', 'That access key was not accepted');
       throw new Error(j.error || 'Server error');
     }
     if (action === 'getAll' || action === 'ping') combinedSync = j.capabilities?.syncBatch === true;
-    if (CFG.url === url) {
+    if (!auth && CFG.url === url) {
       const supportedUrl = j.capabilities?.reportExclusion === true ? url : '';
       if (reportExclusionUrl !== supportedUrl) {
         reportExclusionUrl = supportedUrl;
@@ -771,10 +801,9 @@ async function api(action, payload = {}) {
     logPerformance('Request · ' + action, performance.now() - started, status);
   }
 }
-async function fetchScript(body) {
+async function fetchScript(body, url) {
   const ctl = new AbortController();
   const to = setTimeout(() => ctl.abort(), 90000);
-  const url = CFG.url;
   try {
     const res = await fetch(url, { method: 'POST', body, redirect: 'follow', credentials: 'omit', signal: ctl.signal });
     return await res.text();
@@ -878,7 +907,7 @@ function scheduleSync() {
 }
 function refreshVisible() {
   clearTimeout(visibleRefreshT);
-  if (!(ledgerStore || (CFG.url && CFG.key)) || syncing || connecting || legacyDecisionPending || navigator.onLine === false ||
+  if (!(managedSession || ledgerStore || (CFG.url && CFG.key)) || syncing || connecting || legacyDecisionPending || navigator.onLine === false ||
       document.visibilityState !== 'visible' || LAYERS.length ||
       document.activeElement?.matches('#view input, #view select, #view textarea')) return;
   const wait = RESUME_SYNC_GAP_MS - (Date.now() - lastSyncStart);
@@ -911,6 +940,7 @@ function keyPrompt(wrong) {
 }
 
 async function sync(manual, block) {
+  if (managedMode && !managedSession) return;
   if (syncing) {
     if (manual) {
       repeatManualSync = true;
@@ -930,7 +960,7 @@ async function sync(manual, block) {
     if (manual) toast('Local mode: nothing to sync. Connect a Google Sheet in Settings.');
     return;
   }
-  if (GAS && !CFG.key) { setSync('err', 'Access key needed'); render(); keyPrompt(false); return; }
+  if (GAS && !managedSession && !CFG.key) { setSync('err', 'Access key needed'); render(); keyPrompt(false); return; }
   const lock = !!(block || manual);
   const started = performance.now(), sent = QUEUE.slice(), attempted = new Set(sent);
   let status = 'failed';
@@ -954,7 +984,8 @@ async function sync(manual, block) {
     if (manual) toast(SYNC.warn || (QUEUE.length ? 'New changes are waiting to sync.' : 'Synced'));
   } catch (e) {
     setSync('err', e.message);
-    if (ledgerStore && e.status === 401) { ledgerStore = null; showDriveLogin(e.message); }
+    if (managedSession && e.kind === 'managedauth') endManagedSession('Your sign-in expired or the API key changed. Sign in again.');
+    else if (ledgerStore && e.status === 401) { ledgerStore = null; showDriveLogin(e.message); }
     else if (e instanceof ConnError && (e.kind === 'badkey' || e.kind === 'nokey')) { CFG.key = ''; saveCfg(); keyPrompt(e.kind === 'badkey'); }
     else if (manual) { if (e instanceof ConnError) sheet('Sync failed', connHelp(e.kind), `<button class="btn pri" data-act="lclose">OK</button>`); else toast('Sync failed: ' + (e.message || e)); }
   } finally {
@@ -962,7 +993,7 @@ async function sync(manual, block) {
     if (lock) setBusy(false);
     logPerformance('Sync · total', performance.now() - started, status);
   }
-  if (!driveProfile || ledgerStore) renderAfterSync();
+  if ((!managedMode || managedSession) && (!driveProfile || ledgerStore)) renderAfterSync();
   if (repeatManualSync) {
     repeatManualSync = false;
     sync(true);
@@ -987,14 +1018,15 @@ function renderAfterSync() {
 
 function newPeriod(mode = 'month') { const n = new Date(); return { mode, year: n.getFullYear(), month: n.getMonth(), from: '', to: '' }; }
 const ACT = {}, CHG = {};
-const UI = {
+const newUI = () => ({
   view: 'home', stat: 'balance', selAcc: null, statsOpen: false,
   periods: { stats: newPeriod(), rec: newPeriod('all'), rcp: newPeriod('all') }, rcp: { q: '', limit: 60 },
   rec: { q: '', type: [], acc: [], cat: [], payee: [], limit: 100, fopen: false },
   outlook: 30, bd: { kind: 'expense', cat: [], sub: [], payee: [], acc: [], group: 'category' },
   catTab: 'expense', spendOpen: {}, debtTab: 'owe', bannerOff: LS.get('ft_banner', false),
   msOpen: {}, expAll: false
-};
+});
+const UI = newUI();
 
 const msState = k => { const [s, f] = k.split('.'); return { obj: s === 'rf' ? UI.rec : UI.bd, f }; };
 function msel(key, allLabel, options, extra = '') {
@@ -1090,6 +1122,7 @@ function renderHeader() {
   document.title = (n ? `(${n}) ` : '') + 'Finance Tracker';
 }
 function render() {
+  if (managedMode && !managedSession) return;
   const started = performance.now();
   CUR = DB.settings.currency || '₱';
   renderHeader();
@@ -1395,7 +1428,9 @@ function vSettings() {
 
   <div class="sec"><h2>Data & Sync</h2></div>
   <div class="card" style="margin-top:0">
-   ${driveProfile ? `<p>Google Drive · ${esc(driveProfile.email || 'Connected Google account')}</p>
+   ${managedSession ? `<p>Signed in as ${esc(managedSession.email)}</p>
+   <div class="row" style="margin-bottom:12px"><button class="btn" data-act="syncnow">${ic('sync', 20)}Sync now</button><button class="btn" data-act="managedout">Sign out</button></div>`
+   : driveProfile ? `<p>Google Drive · ${esc(driveProfile.email || 'Connected Google account')}</p>
    <p><a class="link" href="https://docs.google.com/spreadsheets/d/${encodeURIComponent(driveProfile.spreadsheetId)}/edit" target="_blank" rel="noopener">Open my spreadsheet</a></p>
    <button class="btn sm" data-act="syncnow">${ic('sync', 20)}Sync now</button>`
    : `${googleConfig ? `<button class="btn pri full" data-act="driveconnect">${CFG.key ? 'Move your existing ledger' : 'Sign in with Google'}</button>` : ''}
@@ -1418,6 +1453,7 @@ CHG.accountsort = t => {
   $('#view [data-chg="accountsort"]')?.focus({ preventScroll: true });
 };
 ACT.saveconn = async () => {
+  if (managedMode) return;
   if (syncing || connecting) return toast('Wait for the current connection to finish.');
   if (GAS) {
     const k = $('#s-key').value.trim(); if (!k) return toast('Enter the access key');
@@ -2030,11 +2066,12 @@ async function downloadReceipt(r) {
       if (!ledgerStore) throw new Error('Sign in to download this receipt');
       return save(await ledgerStore.readImage(r.image));
     }
+    if (r.image.startsWith('managed:')) return save(await readManagedReceipt(r.image));
     if (r.image.startsWith('data:')) return save(await (await fetch(r.image)).blob());
     const res = await fetch(thumb(r.image, 2000), { mode: 'cors' }); if (!res.ok) throw new Error('blocked');
     save(await res.blob());
   } catch (e) {
-    if (r.image.startsWith('drive:')) return toast('Could not download this receipt from Google Drive.');
+    if (/^(?:drive|managed):/.test(r.image)) return toast('Could not download this receipt from Google Drive.');
     const m = /[?&]id=([^&]+)/.exec(r.image || ''), a = document.createElement('a');
     a.href = m ? `https:\x2f\x2fdrive.google.com/uc?export=download&id=${m[1]}` : r.image; a.target = '_blank'; a.rel = 'noopener'; document.body.appendChild(a); a.click(); a.remove(); toast('Opening the download…');
   }
@@ -2515,8 +2552,8 @@ ACT.pinchange = () => askPin(() => newPinDlg(null, false), { title: 'Current PIN
 ACT.pinforgot = t => {
   closeLayer(t && t.closest ? t.closest('.layer') : null);
   if (driveProfile) return confirmDlg('Sign in with Google again to reset the tracker PIN.', 'Sign in', () => connectDrive(true), false);
-  if (!CFG.url) return toast('Email reset needs the app to be connected to your Google Sheet');
-  confirmDlg('Forgot your PIN? A 6 digit code will be emailed to the owner of the Google Sheet. Enter it here to reset your PIN, then choose a new one.', 'Email me a code', async () => {
+  if (!managedSession && !CFG.url) return toast('Email reset needs the app to be connected to your Google Sheet');
+  confirmDlg(`Forgot your PIN? A 6 digit code will be emailed to ${managedSession ? 'your registered email address' : 'the owner of the Google Sheet'}. Enter it here to reset your PIN, then choose a new one.`, 'Email me a code', async () => {
     setBusy(true, 'Sending the code…');
     try { const r = await api('pinResetRequest'); setBusy(false); pinCodeDlg(r.sentTo, r.minutes); }
     catch (e) { setBusy(false); toast(e instanceof ConnError && (e.kind === 'badkey' || e.kind === 'nokey') ? 'Check the access key in Settings first' : (e.message || 'Could not send the code')); }
@@ -2756,6 +2793,123 @@ async function initializeDrive() {
     if (!googleConfig) legacyDecisionPending = false;
   }
 }
+function showManagedLogin(message = '') {
+  $('#app').hidden = $('#nav').hidden = $('#drive-login').hidden = true;
+  $('#managed-login').hidden = false;
+  const status = $('#managed-error');
+  status.textContent = message;
+  status.hidden = !message;
+  const owner = new URL(managedUrl);
+  owner.searchParams.set('owner', '1');
+  $('#managed-owner').href = owner.href;
+  if (inAndroidWebView) $('#managed-owner').removeAttribute('target');
+}
+
+function endManagedSession(message) {
+  persistNow();
+  if (managedSession && queueDirty) {
+    unsavedManagedQueues.set(managedSession.accountId, QUEUE);
+    message = (message ? message + ' ' : '') + 'This device could not save some pending changes. Keep this tab open and sign in again to recover them.';
+  }
+  queueDirty = dbDirty = false;
+  clearTimeout(syncT);
+  clearTimeout(visibleRefreshT);
+  closeAllLayers();
+  managedSession = null;
+  DB = emptyDB(); QUEUE = []; META = { last: 0 }; ver++;
+  F = FL = RS = TS = null;
+  pinFails = pinLockUntil = 0;
+  MASK.on = true;
+  saveMask();
+  Object.assign(UI, newUI());
+  saveNavigation({ depth: 0, guarded: navigation.guarded, view: UI.view, stat: UI.stat }, 'replaceState');
+  clearProtectedImages();
+  for (const id of ['hdr', 'view', 'nav']) $('#' + id).replaceChildren();
+  performanceLog.length = 0;
+  $('#managed-form').reset();
+  showManagedLogin(message);
+}
+ACT.managedout = () => {
+  if (syncing || connecting) return toast('Wait for the current sync to finish.');
+  persistNow();
+  if (queueDirty) return toast('Sync your pending changes before signing out.');
+  endManagedSession();
+};
+
+async function signInManaged(event) {
+  event.preventDefault();
+  if (connecting || managedSession) return;
+  const form = event.currentTarget, button = form.querySelector('button');
+  const auth = { email: $('#managed-email').value.trim().toLowerCase(), key: $('#managed-key').value.trim() };
+  connecting = true;
+  button.disabled = true;
+  button.textContent = 'Signing in…';
+  showManagedLogin();
+  try {
+    const result = await api('login', {}, auth);
+    if (!/^[a-f0-9]{64}$/.test(result.accountId || '') ||
+        !Object.values(TABLES).every(table => Array.isArray(result.data?.[table])) ||
+        !result.data.settings || typeof result.data.settings !== 'object') throw new Error('The server returned an incomplete ledger.');
+    managedSession = { ...auth, accountId: result.accountId };
+    QUEUE = unsavedManagedQueues.get(result.accountId) || LS.get(cacheKey('queue'), []);
+    queueDirty = unsavedManagedQueues.delete(result.accountId);
+    META = LS.get(cacheKey('meta'), { last: 0 });
+    applyServer(result.data);
+    persistNow();
+    form.reset();
+    $('#managed-login').hidden = true;
+    $('#app').hidden = $('#nav').hidden = false;
+    SYNC.warn = '';
+    setSync(QUEUE.length ? 'pend' : 'ok');
+    seedIfNeeded(); ensureColors(); processPlanned();
+    render();
+    if (!GAS) LS.set('ft_managed_connected', true);
+    if (QUEUE.length) { connecting = false; sync(); }
+  } catch (err) {
+    if (managedSession) endManagedSession();
+    $('#managed-key').value = '';
+    showManagedLogin(err instanceof ConnError && err.kind !== 'managedauth'
+      ? 'Could not reach the tracker sign-in service. Try again.' : err.message);
+  } finally {
+    connecting = false;
+    button.disabled = false;
+    button.textContent = 'Sign In';
+  }
+}
+
+async function configureAccess() {
+  if (GAS) {
+    try {
+      const mode = JSON.parse(await gasCall(JSON.stringify({ action: 'accessMode' })));
+      if (!mode.ok || typeof mode.managedAuth !== 'boolean') throw new Error();
+      if (/^https:\/\/script\.google\.com\/macros\/s\/[-\w]+\/exec$/.test(mode.ownerUrl || '')) managedUrl = mode.ownerUrl;
+      managedMode = mode.managedAuth;
+    } catch (err) {
+      managedMode = true;
+      showManagedLogin('Could not verify the tracker sign-in service. Reload to try again.');
+      return;
+    }
+  } else {
+    managedMode = managedWebDefault || driveParams.get('managed') === '1' || LS.get('ft_managed_connected', false) === true;
+  }
+  if (managedMode) {
+    CFG = { url: '', key: '' };
+    driveProfile = null;
+    Object.assign(UI, newUI());
+    showManagedLogin();
+    $('#managed-form').addEventListener('submit', signInManaged);
+  } else {
+    readDeviceCache();
+    $('#app').hidden = $('#nav').hidden = false;
+    if (driveProfile) showDriveLogin();
+    else if (CFG.url) render();
+    else sync(false, !META.last);
+    initializeDrive().finally(() => {
+      if (CFG.url && !legacyDecisionPending) sync(false, !META.last);
+    });
+    window.__ft = { get DB() { return DB; }, UI, go, ACT };
+  }
+}
 function showDriveLogin(message = '') {
   closeAllLayers();
   $('#app').hidden = $('#nav').hidden = true;
@@ -2865,14 +3019,27 @@ async function connectDrive(resetPin = false) {
 }
 
 const driveImages = new Map();
+function clearProtectedImages() {
+  for (const url of driveImages.values()) url.then(src => { if (src) URL.revokeObjectURL(src); });
+  driveImages.clear();
+}
+async function readManagedReceipt(ref) {
+  if (!managedSession) throw new Error('Sign in to open this receipt.');
+  const data = await api('managedImage', { id: ref.slice('managed:'.length) });
+  if (!/^image\/(?:jpeg|png|webp|gif)$/.test(data.contentType)) throw new Error('Unsupported image.');
+  const bytes = Uint8Array.from(atob(data.base64), char => char.charCodeAt(0));
+  return new Blob([bytes], { type: data.contentType });
+}
 const driveImageObserver = new IntersectionObserver(entries => {
   for (const {target, isIntersecting} of entries) {
-    if (!isIntersecting || !ledgerStore) continue;
-    driveImageObserver.unobserve(target);
     const ref = target.dataset.driveImage;
+    const isManaged = ref.startsWith('managed:');
+    if (!isIntersecting || (isManaged ? !managedSession : !ledgerStore)) continue;
+    driveImageObserver.unobserve(target);
     let url = driveImages.get(ref);
     if (!url) {
-      url = ledgerStore.readImage(ref).then(blob => URL.createObjectURL(blob)).catch(() => {
+      const read = isManaged ? readManagedReceipt(ref) : ledgerStore.readImage(ref);
+      url = read.then(blob => URL.createObjectURL(blob)).catch(() => {
         driveImages.delete(ref);
         return null;
       });
@@ -2882,11 +3049,12 @@ const driveImageObserver = new IntersectionObserver(entries => {
   }
 });
 function watchDriveImages() {
+  const selector = 'img[src^="drive:"],img[src^="managed:"]';
   new MutationObserver(entries => {
     for (const entry of entries) for (const node of entry.addedNodes) {
       if (!(node instanceof HTMLElement)) continue;
-      const images = [...node.querySelectorAll('img[src^="drive:"]')];
-      if (node.matches('img[src^="drive:"]')) images.unshift(node);
+      const images = [...node.querySelectorAll(selector)];
+      if (node.matches(selector)) images.unshift(node);
       for (const img of images) {
         img.dataset.driveImage = img.getAttribute('src');
         img.removeAttribute('src');
@@ -2895,11 +3063,11 @@ function watchDriveImages() {
     }
   }).observe(document.body, { childList: true, subtree: true });
   window.addEventListener('pagehide', event => {
-    if (!event.persisted) for (const url of driveImages.values()) url.then(src => { if (src) URL.revokeObjectURL(src); });
+    if (!event.persisted) clearProtectedImages();
   });
 }
 
-(function boot() {
+(async function boot() {
   installNavigation();
   installKeyboardScrolling();
   CUR = DB.settings.currency || '₱';
@@ -2916,18 +3084,13 @@ function watchDriveImages() {
     logPerformance('Page · download HTML', pageLoad.responseEnd - pageLoad.responseStart);
   }
   watchDriveImages();
-  if (driveProfile) showDriveLogin();
-  else if (CFG.url) render();
-  else sync(false, !META.last);
-  initializeDrive().finally(() => {
-    if (CFG.url && !legacyDecisionPending) sync(false, !META.last);
-  });
+  await configureAccess();
   logPerformance('Startup · first view ready', performance.now());
   setInterval(refreshVisible, SYNC_POLL_MS);
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState !== 'visible') { LS.set('ft_left', Date.now()); persistNow(); return; }
     const maskChanged = awayCheck();
-    if (driveProfile && !ledgerStore) return;
+    if ((managedMode && !managedSession) || (driveProfile && !ledgerStore)) return;
     if (!hasConnection()) { processPlanned(); render(); }
     else {
       if (maskChanged) renderAfterSync();
@@ -2938,7 +3101,6 @@ function watchDriveImages() {
   window.addEventListener('pageshow', e => { if (e.persisted) refreshVisible(); });
   window.addEventListener('online', () => { if (hasConnection()) sync(); });
   window.addEventListener('keydown', e => { if (e.key === 'Escape' && closeTopLayer()) e.preventDefault(); });
-  window.__ft = { get DB() { return DB; }, UI, go, ACT };
   window.__ftReady = true;
 })();
 

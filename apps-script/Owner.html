@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Finance Tracker · User management</title>
+  <style>
+    :root { color-scheme: dark; font: 16px/1.45 system-ui, sans-serif; background: #121212; color: #ececec; }
+    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    body { margin: 0; padding: 24px 16px; }
+    main { width: min(100%, 680px); margin: auto; }
+    header, .actions { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+    header { margin-bottom: 18px; }
+    h1, h2, p { margin: 0; }
+    h1 { font-size: clamp(1.4rem, 6vw, 1.85rem); }
+    h2 { font-size: 1.25rem; }
+    small, .hint { color: #b7b7bf; }
+    #users { list-style: none; margin: 0; padding: 0; border-block: 1px solid #39393e; }
+    #users li { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 12px 0; }
+    #users li + li { border-top: 1px solid #39393e; }
+    .identity { display: grid; flex: 1 1 180px; min-width: 0; overflow-wrap: anywhere; }
+    label { display: grid; gap: 6px; }
+    button, input { min-height: 44px; padding: 8px 12px; background: #262629; border: 1px solid #46464e; color: inherit; font: inherit; border-radius: 10px; }
+    input { width: 100%; min-width: 0; }
+    button { cursor: pointer; }
+    button:disabled { opacity: .55; cursor: default; }
+    .primary { background: #a7d4ff; color: #12253a; border-color: transparent; font-weight: 650; }
+    dialog { width: min(460px, calc(100% - 24px)); padding: 18px; border: 1px solid #46464e; border-radius: 14px; background: #1c1c1e; color: inherit; }
+    dialog::backdrop { background: #0009; }
+    dialog form, .key-panel { display: grid; gap: 12px; }
+    .actions { justify-content: flex-end; }
+    .key-actions { justify-content: flex-start; }
+    .confirm { padding: 10px 0; border-block: 1px solid #39393e; }
+    .confirm .actions { margin-top: 8px; }
+    [role="status"]:empty { display: none; }
+    #status { margin-top: 12px; }
+    #key-value { font-family: ui-monospace, monospace; }
+    #key-email { overflow-wrap: anywhere; }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div><small>System owner · Google account verified</small><h1>User management</h1></div>
+      <button id="add-user" class="primary" type="button">Add user</button>
+    </header>
+    <ul id="users" aria-label="Registered users"></ul>
+    <p id="status" role="status">Loading users…</p>
+  </main>
+  <dialog id="add-dialog" aria-labelledby="add-title">
+    <form id="add-form">
+      <h2 id="add-title">Add user</h2>
+      <p class="hint">A personal Google Sheet and API key are created for this email.</p>
+      <label>Email Address<input id="add-email" type="email" autocomplete="off" maxlength="254" required></label>
+      <p id="add-status" role="status"></p>
+      <div class="actions"><button type="button" data-close>Cancel</button><button class="primary" type="submit">Add user</button></div>
+    </form>
+  </dialog>
+  <dialog id="key-dialog" aria-labelledby="key-title">
+    <div class="key-panel">
+      <h2 id="key-title">Manage API key</h2>
+      <p id="key-email" class="hint"></p>
+      <label>API Key<input id="key-value" type="password" autocomplete="off" readonly></label>
+      <div class="actions key-actions">
+        <button type="button" id="reveal-key" aria-pressed="false" aria-controls="key-value">Show key</button>
+        <button type="button" id="copy-key">Copy key</button>
+        <button type="button" id="rotate-key">Regenerate key</button>
+      </div>
+      <div id="rotate-confirm" class="confirm" hidden>
+        <p>The current key stops working immediately.</p>
+        <div class="actions"><button id="cancel-rotation" type="button">Cancel</button><button id="confirm-rotation" class="primary" type="button">Regenerate</button></div>
+      </div>
+      <p id="key-status" role="status"></p>
+      <div class="actions"><button type="button" data-close>Done</button></div>
+    </div>
+  </dialog>
+  <script>
+    const byId = id => document.getElementById(id);
+    const users = byId('users'), statusLine = byId('status'), addDialog = byId('add-dialog');
+    const keyDialog = byId('key-dialog'), addForm = byId('add-form'), keyValue = byId('key-value');
+    const reveal = byId('reveal-key'), confirmRotation = byId('rotate-confirm'), keyStatus = byId('key-status');
+    let selectedEmail = '';
+    const ownerRequest = (action, email = '') => new Promise((resolve, reject) => {
+      google.script.run
+        .withSuccessHandler(result => result?.ok ? resolve(result) : reject(new Error(result?.error || 'The request failed.')))
+        .withFailureHandler(() => reject(new Error('The owner session could not connect. Reload and try again.')))
+        .ownerRpc(action, email);
+    });
+    function setBusy(dialog, busy) {
+      dialog.querySelectorAll('button').forEach(button => { button.disabled = busy; });
+      dialog.setAttribute('aria-busy', String(busy));
+    }
+    function showKey(show) {
+      keyValue.type = show ? 'text' : 'password';
+      reveal.textContent = show ? 'Hide key' : 'Show key';
+      reveal.setAttribute('aria-pressed', String(show));
+    }
+    function openKey(email) {
+      selectedEmail = email;
+      byId('key-email').textContent = email;
+      keyValue.value = '';
+      keyStatus.textContent = 'Loading key…';
+      confirmRotation.hidden = true;
+      showKey(false);
+      keyDialog.showModal();
+    }
+    async function manageKey(email) {
+      openKey(email);
+      setBusy(keyDialog, true);
+      try {
+        keyValue.value = (await ownerRequest('key', email)).key;
+        keyStatus.textContent = '';
+      } catch (err) {
+        keyStatus.textContent = err.message;
+      } finally {
+        setBusy(keyDialog, false);
+        reveal.disabled = byId('copy-key').disabled = !keyValue.value;
+      }
+    }
+    async function loadUsers() {
+      try {
+        const result = await ownerRequest('list');
+        users.replaceChildren(...result.users.map(user => {
+          const row = document.createElement('li');
+          const identity = document.createElement('div');
+          identity.className = 'identity';
+          const email = document.createElement('strong');
+          email.textContent = user.email;
+          const detail = document.createElement('small');
+          detail.textContent = user.state === 'new' ? 'Personal sheet ready' : 'Existing sheet linked';
+          identity.append(email, detail);
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.textContent = 'Manage key';
+          button.setAttribute('aria-label', 'Manage key for ' + user.email);
+          button.onclick = () => manageKey(user.email);
+          row.append(identity, button);
+          return row;
+        }));
+        statusLine.textContent = result.users.length ? '' : 'No registered users.';
+      } catch (err) {
+        statusLine.textContent = err.message;
+      }
+    }
+    byId('add-user').onclick = () => {
+      addForm.reset();
+      byId('add-status').textContent = '';
+      addDialog.showModal();
+    };
+    addForm.onsubmit = async event => {
+      event.preventDefault();
+      if (addDialog.getAttribute('aria-busy') === 'true') return;
+      const email = byId('add-email').value.trim().toLowerCase();
+      const notice = byId('add-status');
+      notice.textContent = 'Creating the personal sheet…';
+      setBusy(addDialog, true);
+      try {
+        const created = await ownerRequest('add', email);
+        addDialog.close();
+        openKey(email);
+        keyValue.value = created.key;
+        keyStatus.textContent = 'User and spreadsheet created.';
+        loadUsers();
+      } catch (err) {
+        notice.textContent = err.message;
+      } finally {
+        setBusy(addDialog, false);
+      }
+    };
+    document.querySelectorAll('[data-close]').forEach(button => {
+      button.onclick = () => button.closest('dialog').close();
+    });
+    for (const dialog of [addDialog, keyDialog]) {
+      dialog.addEventListener('cancel', event => {
+        if (dialog.getAttribute('aria-busy') === 'true') event.preventDefault();
+      });
+    }
+    keyDialog.addEventListener('close', () => { keyValue.value = ''; selectedEmail = ''; });
+    reveal.onclick = () => showKey(keyValue.type === 'password');
+    byId('copy-key').onclick = async () => {
+      if (!keyValue.value) return;
+      try {
+        await navigator.clipboard.writeText(keyValue.value);
+        keyStatus.textContent = 'API key copied.';
+      } catch (err) {
+        showKey(true);
+        keyValue.select();
+        keyStatus.textContent = 'The API key is selected. Copy it using your keyboard or browser.';
+      }
+    };
+    byId('rotate-key').onclick = () => { confirmRotation.hidden = false; };
+    byId('cancel-rotation').onclick = () => { confirmRotation.hidden = true; };
+    byId('confirm-rotation').onclick = async () => {
+      setBusy(keyDialog, true);
+      keyValue.value = '';
+      showKey(false);
+      keyStatus.textContent = 'Regenerating key…';
+      confirmRotation.hidden = true;
+      try {
+        keyValue.value = (await ownerRequest('regenerate', selectedEmail)).key;
+        keyStatus.textContent = 'New key is ready to copy.';
+      } catch (err) {
+        keyStatus.textContent = err.message;
+      } finally {
+        setBusy(keyDialog, false);
+        reveal.disabled = byId('copy-key').disabled = !keyValue.value;
+      }
+    };
+    window.addEventListener('pagehide', () => { keyValue.value = ''; });
+    loadUsers();
+  </script>
+</body>
+</html>
